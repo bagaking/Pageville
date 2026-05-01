@@ -1,0 +1,686 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Pageville Atlas — a local index for immutable page snapshots.">
+  <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTYiIGZpbGw9IiMxMTE2MWQiLz48cGF0aCBkPSJNMzIgMTN2MzhNMTMgMzJoMzhNMTkgMTlsMjYgMjZNNDUgMTlMMTkgNDUiIHN0cm9rZT0iI2Q3ZmY0ZiIgc3Ryb2tlLXdpZHRoPSI1Ii8+PC9zdmc+">
+  <title>Pageville / Atlas</title>
+  <style>
+    :root {
+      --ink: #0b0d12;
+      --ink-deep: #080a0f;
+      --ink-soft: #141820;
+      --ink-lift: #1d222c;
+      --surface-1: #11161d;
+      --surface-2: #181f28;
+      --surface-3: #232b36;
+      --paper: #f2eee5;
+      --paper-strong: #fbf8f0;
+      --paper-soft: #e4ded2;
+      --paper-dim: #cfc9bd;
+      --acid: #d7ff4f;
+      --cyan: #8be8ff;
+      --coral: #ff8e6e;
+      --muted: #9ca2ad;
+      --muted-dark: #666d78;
+      --surface-shadow: 0 14px 34px rgba(0, 0, 0, .18);
+      --display: clamp(4.1rem, 12.2vw, 11.8rem);
+      --ease: cubic-bezier(.22, .8, .25, 1);
+      --panel-radius: 24px;
+      --control-radius: 999px;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--ink); color: var(--paper); scroll-behavior: smooth; }
+    body {
+      min-width: 320px;
+      margin: 0;
+      background:
+        radial-gradient(circle at 73% 12%, rgba(139, 232, 255, .11), transparent 25rem),
+        radial-gradient(circle at 9% 63%, rgba(215, 255, 79, .06), transparent 23rem),
+        var(--ink);
+      color: var(--paper);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.4;
+      overflow-x: hidden;
+    }
+    body::before {
+      position: fixed;
+      z-index: 0;
+      inset: 0;
+      pointer-events: none;
+      content: "";
+      opacity: .3;
+      background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 56px 56px;
+      mask-image: linear-gradient(to bottom, black, transparent 80%);
+    }
+    a { color: inherit; }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    :focus-visible { outline: 2px solid var(--acid); outline-offset: 4px; }
+
+    .shell { position: relative; z-index: 1; width: min(1380px, calc(100% - 64px)); margin: 0 auto; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 74px;
+      padding: 0 14px;
+      border-radius: 0 0 18px 18px;
+      background: linear-gradient(180deg, rgba(20, 24, 32, .9), rgba(20, 24, 32, .55));
+      box-shadow: 0 10px 26px rgba(0, 0, 0, .14);
+      gap: 24px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .14em;
+      text-decoration: none;
+    }
+    .brand-mark {
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--surface-3);
+      color: var(--acid);
+      font-size: 13px;
+      letter-spacing: 0;
+      box-shadow: inset 0 1px 0 rgba(242, 238, 229, .2), 0 5px 14px rgba(0, 0, 0, .22);
+    }
+    .top-meta { display: flex; align-items: center; gap: 20px; min-width: 0; }
+    .micro-label, .eyebrow, .section-label {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+    .host-address {
+      max-width: 30vw;
+      overflow: hidden;
+      color: var(--paper-dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .ghost-button, .primary-button, .copy-button {
+      min-height: 44px;
+      border: 0;
+      border-radius: var(--control-radius);
+      cursor: pointer;
+      transition: background .22s var(--ease), color .22s var(--ease), transform .22s var(--ease), box-shadow .22s var(--ease);
+    }
+    .ghost-button {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 15px;
+      background: var(--surface-2);
+      color: var(--paper-dim);
+      font-size: 12px;
+      box-shadow: inset 0 1px 0 rgba(242, 238, 229, .1), 0 7px 18px rgba(0, 0, 0, .14);
+    }
+    .ghost-button:hover { background: var(--surface-3); color: var(--paper); transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(242, 238, 229, .15), 0 10px 22px rgba(0, 0, 0, .2); }
+    .ghost-button:active, .primary-button:active, .copy-button:active, .command-copy:active { transform: translateY(1px) scale(.98); }
+    .ghost-button[aria-busy="true"] .refresh-glyph { animation: spin 1s linear infinite; }
+    .refresh-glyph { display: inline-block; font-size: 16px; line-height: 1; }
+
+    .hero {
+      position: relative;
+      min-height: 350px;
+      padding: 42px 0 48px;
+      border-radius: 0 0 30px 30px;
+      background: linear-gradient(118deg, rgba(20, 24, 32, .62), rgba(20, 24, 32, .12) 68%, rgba(139, 232, 255, .06));
+      box-shadow: inset 0 -1px 0 rgba(242, 238, 229, .04), 0 16px 38px rgba(0, 0, 0, .08);
+      overflow: hidden;
+    }
+    .hero-copy { position: relative; z-index: 2; max-width: 980px; }
+    .hero-kicker { display: flex; align-items: center; gap: 11px; color: var(--paper-dim); font-size: 12px; }
+    .signal-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--acid); box-shadow: 0 0 0 5px rgba(215,255,79,.12); }
+    .signal-dot.is-error { background: var(--coral); box-shadow: 0 0 0 5px rgba(255,142,110,.12); }
+    .signal-dot.is-loading { background: var(--cyan); animation: blink 1.1s ease-in-out infinite; }
+    .protocol-chip { margin-left: 14px; padding: 6px 10px; border-radius: var(--control-radius); background: var(--surface-2); color: var(--muted); font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: .08em; box-shadow: inset 0 1px 0 rgba(242, 238, 229, .08); }
+    h1 { margin: 21px 0 15px; font-size: var(--display); font-weight: 900; letter-spacing: -.085em; line-height: .78; text-transform: uppercase; }
+    h1 span { display: block; }
+    h1 .hero-sub { color: var(--acid); font-size: .52em; letter-spacing: -.055em; line-height: 1.05; }
+    .hero-description { max-width: 490px; margin: 0; color: var(--paper-dim); font-size: clamp(14px, 1.35vw, 18px); line-height: 1.5; }
+    .hero-stamp {
+      position: absolute;
+      z-index: 3;
+      right: 0;
+      bottom: 44px;
+      display: grid;
+      width: 86px;
+      height: 86px;
+      place-content: center;
+      border-radius: 50%;
+      background: rgba(20, 24, 32, .76);
+      color: var(--paper-dim);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .15em;
+      text-align: center;
+      text-transform: uppercase;
+      transform: rotate(-10deg);
+      box-shadow: inset 0 1px 0 rgba(242, 238, 229, .18), 0 12px 28px rgba(0, 0, 0, .2);
+      backdrop-filter: blur(8px);
+    }
+    .hero-stamp strong { display: block; margin-top: 1px; color: var(--paper); font-size: 30px; letter-spacing: -.08em; line-height: 1; }
+    .orbit {
+      position: absolute;
+      z-index: 1;
+      right: -18%;
+      bottom: -52px;
+      width: min(520px, 46vw);
+      aspect-ratio: 1;
+      border: 1px solid rgba(139,232,255,.26);
+      border-radius: 50%;
+      transform: rotate(-14deg);
+    }
+    .orbit::before, .orbit::after { position: absolute; inset: 13%; border: 1px solid rgba(242,238,229,.1); border-radius: 50%; content: ""; }
+    .orbit::after { inset: 31%; border-color: rgba(215,255,79,.16); }
+    .orbit-cross { position: absolute; inset: 0; }
+    .orbit-cross::before, .orbit-cross::after { position: absolute; content: ""; background: rgba(242,238,229,.1); }
+    .orbit-cross::before { top: 50%; right: -7%; left: -7%; height: 1px; }
+    .orbit-cross::after { top: -7%; bottom: -7%; left: 50%; width: 1px; }
+    .orbit-node {
+      position: absolute;
+      display: grid;
+      width: 25px;
+      height: 25px;
+      padding: 0;
+      place-items: center;
+      border: 1px solid var(--cyan);
+      border-radius: 50%;
+      background: var(--ink);
+      color: var(--cyan);
+      cursor: pointer;
+      font-family: ui-monospace, monospace;
+      font-size: 9px;
+      transform: translate(-50%, -50%) rotate(14deg);
+      transition: width .3s var(--ease), height .3s var(--ease), background .3s var(--ease), color .3s var(--ease), box-shadow .3s var(--ease);
+    }
+    .orbit-node::after { position: absolute; width: 4px; height: 4px; border-radius: 50%; background: currentColor; content: ""; }
+    .orbit-node:hover, .orbit-node.is-selected { width: 35px; height: 35px; border-color: var(--acid); background: var(--acid); color: var(--ink); box-shadow: 0 0 0 8px rgba(215,255,79,.12), 0 0 32px rgba(215,255,79,.25); }
+    .orbit-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+    .orbit-empty[hidden] { display: none; }
+
+    .workspace { display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(360px, .88fr); gap: 22px; padding: 30px 0 38px; }
+    .index-panel { min-width: 0; }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 21px; }
+    .section-head h2 { margin: 6px 0 0; font-size: 33px; letter-spacing: -.06em; line-height: 1; }
+    .filter-tabs { display: flex; align-items: center; gap: 5px; }
+    .filter-tab { min-height: 44px; padding: 0 13px; border: 0; border-radius: var(--control-radius); background: var(--surface-1); color: var(--muted); cursor: pointer; font-size: 11px; box-shadow: inset 0 1px 0 rgba(242, 238, 229, .07); transition: background .22s var(--ease), color .22s var(--ease), transform .22s var(--ease), box-shadow .22s var(--ease); }
+    .filter-tab:hover { background: var(--surface-2); color: var(--paper); transform: translateY(-1px); }
+    .filter-tab.is-active { background: var(--acid); color: var(--ink); font-weight: 750; box-shadow: 0 7px 18px rgba(215, 255, 79, .14), inset 0 1px 0 rgba(255, 255, 255, .36); }
+    .search-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; padding: 5px 9px 5px 12px; border-radius: 14px; background: var(--surface-1); box-shadow: inset 0 1px 0 rgba(242, 238, 229, .07), 0 8px 22px rgba(0, 0, 0, .1); }
+    .search-wrap { position: relative; flex: 1; }
+    .search-wrap::before { position: absolute; top: 50%; left: 0; color: var(--muted); content: "⌕"; font-size: 21px; line-height: 1; transform: translateY(-55%); }
+    .search-input { width: 100%; padding: 8px 10px 8px 26px; border: 0; outline: 0; background: transparent; color: var(--paper); font-size: 14px; }
+    .search-input::placeholder { color: var(--muted-dark); }
+    .result-count { padding: 7px 9px; border-radius: var(--control-radius); background: var(--surface-2); color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }
+    .project-list { min-height: 170px; display: grid; gap: 7px; align-content: start; }
+    .project-row {
+      position: relative;
+      display: grid;
+      grid-template-columns: 40px minmax(0, 1fr) auto;
+      align-items: center;
+      width: 100%;
+      min-height: 76px;
+      padding: 13px 14px;
+      border: 0;
+      border-radius: 14px;
+      background: var(--surface-1);
+      color: var(--paper);
+      cursor: pointer;
+      text-align: left;
+      box-shadow: inset 0 1px 0 rgba(242, 238, 229, .06), 0 7px 18px rgba(0, 0, 0, .08);
+      transition: transform .25s var(--ease), background .25s var(--ease), color .25s var(--ease), box-shadow .25s var(--ease);
+    }
+    .project-row:hover { transform: translateX(3px); background: var(--surface-2); box-shadow: inset 0 1px 0 rgba(242, 238, 229, .1), 0 12px 24px rgba(0, 0, 0, .16); }
+    .project-row.is-selected { padding: 13px 14px; border-radius: 14px; background: var(--paper); color: var(--ink); box-shadow: 0 14px 30px rgba(0, 0, 0, .2), inset 0 1px 0 rgba(255, 255, 255, .55); }
+    .project-index { display: inline-flex; width: 27px; height: 27px; align-items: center; justify-content: center; align-self: start; margin-top: 1px; border-radius: 8px; background: var(--surface-2); color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }
+    .is-selected .project-index { color: var(--muted-dark); }
+    .project-main { min-width: 0; }
+    .project-name { display: block; overflow: hidden; font-size: 19px; font-weight: 720; letter-spacing: -.045em; text-overflow: ellipsis; white-space: nowrap; }
+    .project-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 5px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 10px; }
+    .is-selected .project-meta { color: var(--muted-dark); }
+    .status-mini { display: inline-flex; align-items: center; gap: 5px; font-family: inherit; }
+    .status-mini::before { width: 5px; height: 5px; border-radius: 50%; background: var(--acid); content: ""; }
+    .is-selected .status-mini::before { background: #6b8c00; }
+    .spa-badge { padding: 3px 7px; border-radius: 99px; background: rgba(139, 232, 255, .13); font-size: 9px; letter-spacing: .08em; }
+    .row-chevron { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 50%; background: var(--surface-2); color: var(--muted); font-size: 19px; transition: transform .22s var(--ease), color .22s var(--ease), background .22s var(--ease); }
+    .project-row:hover .row-chevron, .project-row.is-selected .row-chevron { color: currentColor; transform: translateX(3px); }
+    .project-row.is-selected .project-index, .project-row.is-selected .row-chevron { background: rgba(11, 13, 18, .09); }
+    .skeleton-row { display: grid; grid-template-columns: 40px 1fr; gap: 14px; align-items: center; min-height: 76px; padding: 13px 14px; border-radius: 14px; background: var(--surface-1); box-shadow: inset 0 1px 0 rgba(242, 238, 229, .06); }
+    .skeleton-row span { display: block; height: 10px; border-radius: 10px; background: linear-gradient(90deg, var(--ink-lift), #232a34, var(--ink-lift)); background-size: 220% 100%; animation: shimmer 1.4s linear infinite; }
+    .skeleton-row span:last-child { width: 68%; height: 19px; }
+    .empty-field, .error-field { display: grid; min-height: 190px; place-content: center; padding: 28px; border-radius: 18px; background: var(--surface-1); text-align: center; box-shadow: inset 0 1px 0 rgba(242, 238, 229, .06), 0 10px 24px rgba(0, 0, 0, .1); }
+    .empty-field strong, .error-field strong { display: block; margin-bottom: 8px; font-size: 20px; letter-spacing: -.04em; }
+    .empty-field p, .error-field p { max-width: 330px; margin: 0 auto; color: var(--muted); font-size: 13px; }
+    .error-field { background: linear-gradient(135deg, rgba(255, 142, 110, .14), var(--surface-1) 65%); box-shadow: inset 0 1px 0 rgba(255, 142, 110, .18), 0 10px 24px rgba(0, 0, 0, .1); }
+    .error-field strong { color: var(--coral); }
+    .inline-retry { margin-top: 18px; }
+
+    .dossier {
+      min-width: 0;
+      min-height: 460px;
+      padding: 26px;
+      border-radius: var(--panel-radius);
+      background: var(--paper);
+      color: var(--ink);
+      box-shadow: 0 22px 80px rgba(0,0,0,.2);
+    }
+    .dossier.is-empty { display: grid; place-items: center; background: var(--surface-1); color: var(--paper); box-shadow: var(--surface-shadow); }
+    .dossier-empty { max-width: 260px; text-align: center; }
+    .dossier-empty .empty-mark { display: grid; width: 64px; height: 64px; margin: 0 auto 18px; place-items: center; border-radius: 50%; background: var(--surface-3); color: var(--acid); font-size: 24px; box-shadow: inset 0 1px 0 rgba(242, 238, 229, .12), 0 10px 24px rgba(0, 0, 0, .2); }
+    .dossier-empty strong { display: block; font-size: 21px; letter-spacing: -.05em; }
+    .dossier-empty p { margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+    .dossier-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted-dark); }
+    .dossier-number { font-family: ui-monospace, monospace; font-size: 11px; }
+    .dossier h2 { overflow-wrap: anywhere; margin: 21px 0 5px; font-size: clamp(35px, 4vw, 58px); letter-spacing: -.085em; line-height: .9; }
+    .dossier-slug { color: var(--muted-dark); font-family: ui-monospace, monospace; font-size: 12px; }
+    .latest-box { display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: end; margin-top: 28px; padding: 16px; border-radius: 16px; background: var(--paper-soft); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .48), 0 8px 20px rgba(11, 13, 18, .08); }
+    .latest-label { color: var(--muted-dark); font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+    .latest-id { display: block; margin-top: 6px; overflow: hidden; color: var(--ink); font-family: ui-monospace, monospace; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+    .latest-actions { display: flex; align-items: center; gap: 7px; }
+    .primary-button, .copy-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 0; color: var(--ink); font-size: 11px; font-weight: 750; letter-spacing: .03em; text-decoration: none; white-space: nowrap; }
+    .primary-button { background: var(--acid); box-shadow: 0 8px 20px rgba(215, 255, 79, .18), inset 0 1px 0 rgba(255, 255, 255, .5); }
+    .primary-button:hover { background: #e6ff86; transform: translateY(-1px); box-shadow: 0 12px 26px rgba(215, 255, 79, .26), inset 0 1px 0 rgba(255, 255, 255, .58); }
+    .copy-button { background: var(--paper-strong); box-shadow: 0 7px 18px rgba(11, 13, 18, .1), inset 0 1px 0 rgba(255, 255, 255, .7); }
+    .copy-button:hover { background: #fffdf8; transform: translateY(-1px); box-shadow: 0 10px 22px rgba(11, 13, 18, .15), inset 0 1px 0 rgba(255, 255, 255, .8); }
+    .copy-button.is-copied { background: var(--acid); color: var(--ink); }
+    .dossier-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 23px; }
+    .metric { min-width: 0; padding: 12px 11px; border-radius: 12px; background: rgba(11, 13, 18, .055); }
+    .metric-label { display: block; color: var(--muted-dark); font-size: 9px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    .metric strong { display: block; margin-top: 5px; font-family: ui-monospace, monospace; font-size: 22px; letter-spacing: -.06em; }
+    .history { margin-top: 27px; }
+    .history-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .history-head h3 { margin: 0; font-size: 15px; letter-spacing: -.025em; }
+    .history-head span { color: var(--muted-dark); font-family: ui-monospace, monospace; font-size: 10px; }
+    .snapshot-list { display: grid; gap: 6px; margin-top: 10px; }
+    .snapshot-row { display: grid; grid-template-columns: 10px minmax(0,1fr) auto; gap: 10px; align-items: center; min-height: 43px; padding: 6px 7px 6px 10px; border-radius: 11px; background: rgba(11, 13, 18, .055); }
+    .snapshot-row.is-latest { background: rgba(215, 255, 79, .22); }
+    .snapshot-dot { width: 8px; height: 8px; border-radius: 50%; background: rgba(11, 13, 18, .2); }
+    .snapshot-row.is-latest .snapshot-dot { background: var(--acid); box-shadow: 0 0 0 3px rgba(107, 140, 0, .15); }
+    .snapshot-id { overflow: hidden; font-family: ui-monospace, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .snapshot-date { color: var(--muted-dark); font-family: ui-monospace, monospace; font-size: 10px; white-space: nowrap; }
+    .snapshot-link { display: inline-flex; min-width: 32px; min-height: 32px; align-items: center; justify-content: center; border-radius: 50%; color: var(--ink); text-decoration: none; transition: background .2s ease; }
+    .snapshot-link { background: rgba(11, 13, 18, .07); }
+    .snapshot-link:hover { background: rgba(11,13,18,.15); }
+    .event-line { display: flex; align-items: center; gap: 8px; margin-top: 20px; color: var(--muted-dark); font-size: 11px; }
+    .event-line strong { color: var(--ink); font-family: ui-monospace, monospace; font-size: 13px; }
+    .event-pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 4px rgba(139,232,255,.24); }
+
+    .handoff {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(300px, .76fr);
+      gap: 24px;
+      align-items: center;
+      margin: 0 0 42px;
+      padding: 25px 26px;
+      border-radius: 22px;
+      background: linear-gradient(100deg, rgba(215, 255, 79, .12), rgba(139, 232, 255, .08) 55%, var(--surface-1));
+      box-shadow: var(--surface-shadow), inset 0 1px 0 rgba(242, 238, 229, .09);
+    }
+    .handoff h2 { margin: 5px 0 8px; font-size: 26px; letter-spacing: -.065em; }
+    .handoff p { max-width: 550px; margin: 0; color: var(--muted); font-size: 13px; }
+    .command-box { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px; padding: 5px 6px 5px 15px; border-radius: 14px; background: var(--ink-deep); box-shadow: inset 0 1px 0 rgba(242, 238, 229, .08), 0 9px 22px rgba(0, 0, 0, .18); }
+    .command-box code { overflow: hidden; color: var(--paper); font-family: ui-monospace, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .command-copy { flex: 0 0 auto; min-height: 44px; padding: 0 13px; border: 0; border-radius: 10px; background: var(--acid); color: var(--ink); cursor: pointer; font-size: 11px; font-weight: 750; box-shadow: 0 6px 16px rgba(215, 255, 79, .15), inset 0 1px 0 rgba(255, 255, 255, .5); transition: background .22s var(--ease), transform .22s var(--ease), box-shadow .22s var(--ease); }
+    .command-copy:hover { background: #e6ff86; transform: translateY(-1px); box-shadow: 0 9px 20px rgba(215, 255, 79, .22), inset 0 1px 0 rgba(255, 255, 255, .6); }
+    .command-copy.is-copied { background: var(--acid); }
+    footer { display: flex; align-items: center; justify-content: space-between; min-height: 72px; padding: 0 14px; border-radius: 16px 16px 0 0; background: var(--surface-1); color: var(--muted); font-size: 11px; box-shadow: inset 0 1px 0 rgba(242, 238, 229, .06); }
+    footer code { color: var(--paper-dim); font-family: ui-monospace, monospace; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .live-region { position: fixed; z-index: 9; right: 20px; bottom: 20px; max-width: 300px; padding: 11px 14px; border-radius: 12px; background: var(--surface-3); color: var(--paper); font-size: 12px; opacity: 0; pointer-events: none; transform: translateY(10px); box-shadow: 0 14px 30px rgba(0, 0, 0, .28), inset 0 1px 0 rgba(242, 238, 229, .12); transition: opacity .2s ease, transform .2s ease; }
+    .live-region.is-visible { opacity: 1; transform: translateY(0); }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes blink { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+    @keyframes shimmer { to { background-position: -220% 0; } }
+    @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .hero-copy, .workspace, .handoff { animation: rise .7s var(--ease) both; }
+    .workspace { animation-delay: .08s; }
+    .handoff { animation-delay: .14s; }
+
+    @media (max-width: 980px) {
+      .shell { width: min(100% - 40px, 760px); }
+      .hero { min-height: 330px; }
+      .orbit { right: -15%; width: 430px; }
+      .hero-stamp { right: 2%; bottom: 34px; }
+      .workspace { grid-template-columns: 1fr; }
+      .dossier { min-height: auto; }
+      .handoff { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 620px) {
+      .shell { width: calc(100% - 32px); }
+      .topbar { min-height: 64px; }
+      .top-meta { gap: 10px; }
+      .host-address, .micro-label { display: none; }
+      .ghost-button { padding: 0 12px; }
+      .hero { min-height: 360px; padding-top: 32px; }
+      h1 { margin-top: 24px; font-size: clamp(3.2rem, 18vw, 6.2rem); line-height: .8; }
+      .hero-description { max-width: min(290px, calc(100% - 96px)); font-size: 14px; }
+      .hero-stamp { right: 0; bottom: 30px; width: 72px; height: 72px; }
+      .hero-stamp strong { font-size: 25px; }
+      .orbit { right: -42%; bottom: -135px; width: 330px; opacity: .72; }
+      .workspace { padding-top: 25px; }
+      .section-head { display: block; }
+      .filter-tabs { margin-top: 17px; }
+      .filter-tab { min-height: 44px; }
+      .project-row { grid-template-columns: 32px minmax(0, 1fr) 22px; min-height: 84px; }
+      .project-name { font-size: 18px; }
+      .project-meta { row-gap: 5px; }
+      .dossier { padding: 20px; border-radius: 19px; }
+      .latest-box { grid-template-columns: 1fr; align-items: start; }
+      .latest-actions { flex-wrap: wrap; }
+      .primary-button, .copy-button { min-height: 44px; }
+      .handoff { margin-bottom: 25px; padding: 21px 18px; }
+      .command-box { min-width: 0; }
+      .command-box code { font-size: 10px; }
+      footer { display: flex; align-items: flex-start; justify-content: center; gap: 4px; padding: 16px 14px; line-height: 1.45; }
+      footer code { display: block; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .001ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Pageville Atlas home"><span class="brand-mark" aria-hidden="true">✳</span><span>PAGEVILLE</span></a>
+      <div class="top-meta">
+        <span class="micro-label">Local host</span>
+        <code class="host-address" id="host-address">127.0.0.1</code>
+        <button class="ghost-button" id="refresh-button" type="button" aria-label="Refresh project index">
+          <span class="refresh-glyph" aria-hidden="true">↻</span><span>Refresh</span>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <div class="hero-kicker"><span class="signal-dot" id="signal-dot" aria-hidden="true"></span><span id="host-status">Connecting to host</span><span class="protocol-chip">API / V0</span></div>
+          <h1 id="hero-title"><span>Pageville</span><span class="hero-sub">/ Atlas</span></h1>
+          <p class="hero-description">A living index for the pages you publish locally. Find the current release, inspect its trail, and open the exact surface you mean.</p>
+          <div class="hero-stamp" aria-label="Indexed project count"><span>Indexed</span><strong id="page-count">—</strong></div>
+        </div>
+        <div class="orbit" id="orbit" aria-label="Project constellation" role="group"><span class="orbit-cross" aria-hidden="true"></span><span class="orbit-empty" id="orbit-empty">scanning the host</span></div>
+      </section>
+
+      <section class="workspace" aria-label="Project index and selected project">
+        <section class="index-panel" aria-labelledby="projects-heading">
+          <div class="section-head">
+            <div><span class="section-label">01 / Project index</span><h2 id="projects-heading">Projects</h2></div>
+            <div class="filter-tabs" role="tablist" aria-label="Project filters">
+              <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-filter="all">All</button>
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-filter="recent">Recent</button>
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-filter="spa">SPA</button>
+            </div>
+          </div>
+          <div class="search-row">
+            <label class="search-wrap"><span class="sr-only">Filter projects by name</span><input class="search-input" id="search-input" type="search" autocomplete="off" placeholder="Filter by page name" spellcheck="false"></label>
+            <span class="result-count" id="result-count">— results</span>
+          </div>
+          <div class="project-list" id="project-list" role="list" aria-live="polite"></div>
+        </section>
+
+        <aside class="dossier is-empty" id="dossier" aria-label="Selected project dossier">
+          <div class="dossier-empty" id="dossier-empty"><span class="empty-mark" aria-hidden="true">＋</span><strong>Select a project</strong><p>The dossier will show its latest release, history, and event pulse.</p></div>
+          <div id="dossier-content" hidden>
+            <div class="dossier-top"><span class="section-label">02 / Selected project</span><span class="dossier-number" id="dossier-number">—</span></div>
+            <h2 id="dossier-heading">—</h2>
+            <div class="dossier-slug" id="dossier-slug">—</div>
+            <div class="latest-box">
+              <div><span class="latest-label">Latest snapshot</span><code class="latest-id" id="latest-id">—</code></div>
+              <div class="latest-actions"><a class="primary-button" id="open-latest" href="#" target="_blank" rel="noreferrer">Open latest <span aria-hidden="true">↗</span></a><button class="copy-button" id="copy-url" type="button">Copy URL</button></div>
+            </div>
+            <div class="dossier-metrics"><div class="metric"><span class="metric-label">Snapshots</span><strong id="snapshot-count">—</strong></div><div class="metric"><span class="metric-label">Mode</span><strong id="spa-mode">—</strong></div><div class="metric"><span class="metric-label">Events</span><strong id="event-count">—</strong></div></div>
+            <div class="history"><div class="history-head"><h3>Release trail</h3><span id="history-caption">immutable</span></div><div class="snapshot-list" id="snapshot-list"></div></div>
+            <div class="event-line"><span class="event-pulse" aria-hidden="true"></span><span><strong id="event-line-count">0</strong> event records attached to this page</span></div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="handoff" aria-labelledby="handoff-heading">
+        <div><span class="section-label">03 / Publish handoff</span><h2 id="handoff-heading">Keep the write path explicit.</h2><p>The hall reads the host. Publish a new immutable snapshot from your terminal, then return here to see it enter the atlas.</p></div>
+        <div class="command-box"><code id="publish-command">pageville publish ./site --page my-page</code><button class="command-copy" id="copy-command" type="button">Copy command</button></div>
+      </section>
+    </main>
+
+    <footer><span>Pageville Atlas · local-first by design</span><code id="footer-protocol">/api/v0/health</code></footer>
+  </div>
+  <div class="live-region" id="live-region" role="status" aria-live="polite"></div>
+  <noscript><p style="max-width:600px;margin:40px auto;padding:20px;color:#f2eee5">Pageville Atlas needs JavaScript to read the local API. Use the CLI: <code>pageville pages list</code>.</p></noscript>
+
+  <script>
+    (() => {
+      "use strict";
+      const state = { pages: [], selected: null, snapshots: [], eventCount: null, filter: "all", query: "", request: 0, loading: false };
+      const $ = (id) => document.getElementById(id);
+      const list = $("project-list");
+      const dossier = $("dossier");
+      const dossierEmpty = $("dossier-empty");
+      const dossierContent = $("dossier-content");
+      const orbit = $("orbit");
+      const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
+      const slugPath = (page, suffix = "latest/") => `/${encodeURIComponent(page)}/${suffix}`;
+      const latestUrl = (page) => `${window.location.origin}${slugPath(page)}`;
+      const announce = (message) => { const node = $("live-region"); node.textContent = message; node.classList.add("is-visible"); clearTimeout(announce.timer); announce.timer = setTimeout(() => node.classList.remove("is-visible"), 2400); };
+      const formatDate = (value) => { if (!value) return "unknown"; const date = new Date(value); if (Number.isNaN(date.valueOf())) return value; return new Intl.DateTimeFormat(undefined, { month: "short", day: "2-digit", year: "numeric" }).format(date); };
+      const api = async (path) => { const response = await fetch(path, { headers: { accept: "application/json" }, cache: "no-store" }); if (!response.ok) throw new Error(`HTTP ${response.status}`); return response; };
+      const readJson = async (path) => (await api(path)).json();
+      const readEvents = async (page) => { const response = await api(`/api/v0/pages/${encodeURIComponent(page)}/events`); const text = await response.text(); return text.trim() ? text.trim().split("\n").filter(Boolean).length : 0; };
+
+      function setHost(status, kind = "ok") {
+        $("host-status").textContent = status;
+        const dot = $("signal-dot");
+        dot.className = `signal-dot${kind === "error" ? " is-error" : kind === "loading" ? " is-loading" : ""}`;
+      }
+
+      function filteredPages() {
+        const query = state.query.trim().toLowerCase();
+        return state.pages.filter((item) => {
+          if (query && !item.page.toLowerCase().includes(query)) return false;
+          if (state.filter === "spa") return item._spa === true;
+          if (state.filter === "recent") return item._recent === true;
+          return true;
+        });
+      }
+
+      function renderLoading() {
+        list.innerHTML = Array.from({ length: 4 }, (_, index) => `<div class="skeleton-row" role="listitem"><span>${index + 1}</span><span></span></div>`).join("");
+        $("result-count").textContent = "scanning…";
+        $("page-count").textContent = "—";
+        $("orbit-empty").hidden = false;
+        $("orbit-empty").textContent = "scanning the host";
+      }
+
+      function renderOrbit(items) {
+        orbit.querySelectorAll(".orbit-node").forEach((node) => node.remove());
+        const empty = $("orbit-empty");
+        if (!items.length) { empty.hidden = false; return; }
+        empty.hidden = true;
+        const radius = items.length === 1 ? 30 : 35;
+        items.slice(0, 18).forEach((item, index) => {
+          const angle = (Math.PI * 2 * index / Math.max(items.length, 1)) - Math.PI / 2;
+          const node = document.createElement("button");
+          node.type = "button";
+          node.className = `orbit-node${state.selected === item.page ? " is-selected" : ""}`;
+          node.style.left = `${50 + Math.cos(angle) * radius}%`;
+          node.style.top = `${50 + Math.sin(angle) * radius}%`;
+          node.title = item.page;
+          node.setAttribute("aria-label", `Select project ${item.page}`);
+          node.textContent = String(index + 1).padStart(2, "0");
+          node.addEventListener("click", () => selectProject(item.page));
+          orbit.appendChild(node);
+        });
+      }
+
+      function renderList() {
+        const items = filteredPages();
+        $("result-count").textContent = `${items.length} ${items.length === 1 ? "result" : "results"}`;
+        $("page-count").textContent = state.pages.length;
+        renderOrbit(state.pages);
+        if (!items.length) {
+          if (!state.pages.length) $("orbit-empty").textContent = "no projects yet";
+          const title = state.pages.length ? "No matching projects" : "No projects indexed";
+          const copy = state.pages.length ? "Try a different name or clear the filter." : "Publish a page from the terminal and it will appear here.";
+          list.innerHTML = `<div class="empty-field" role="listitem"><div><strong>${title}</strong><p>${copy}</p></div></div>`;
+          return;
+        }
+        list.innerHTML = items.map((item, index) => {
+          const selected = state.selected === item.page;
+          const latest = item.latest || "unpublished";
+          return `<div class="project-item" role="listitem"><button class="project-row${selected ? " is-selected" : ""}" type="button" aria-pressed="${selected}" data-page="${escapeHtml(item.page)}">
+            <span class="project-index">${String(index + 1).padStart(2, "0")}</span>
+            <span class="project-main"><span class="project-name">${escapeHtml(item.page)}</span><span class="project-meta"><span class="status-mini">LIVE</span><span>${escapeHtml(latest)}</span>${item._spa ? '<span class="spa-badge">SPA</span>' : ""}</span></span>
+            <span class="row-chevron" aria-hidden="true">↗</span>
+          </button></div>`;
+        }).join("");
+        list.querySelectorAll("[data-page]").forEach((row) => {
+          row.addEventListener("click", () => selectProject(row.dataset.page));
+          row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectProject(row.dataset.page); } });
+        });
+      }
+
+      function showDossierEmpty() {
+        dossier.classList.add("is-empty");
+        dossierEmpty.hidden = false;
+        dossierContent.hidden = true;
+      }
+
+      function renderDossier() {
+        const item = state.pages.find((page) => page.page === state.selected);
+        if (!item) { showDossierEmpty(); return; }
+        dossier.classList.remove("is-empty");
+        dossierEmpty.hidden = true;
+        dossierContent.hidden = false;
+        const snapshots = state.snapshots;
+        const latest = snapshots[0] || { snapshot_id: item.latest, spa: item._spa, created_at: "" };
+        $("dossier-number").textContent = `#${String(state.pages.indexOf(item) + 1).padStart(2, "0")}`;
+        $("dossier-heading").textContent = item.page;
+        $("dossier-slug").textContent = `/${item.page}/`;
+        $("latest-id").textContent = latest.snapshot_id || "—";
+        const latestHref = slugPath(item.page);
+        $("open-latest").href = latestHref;
+        $("copy-url").dataset.url = `${window.location.origin}${latestHref}`;
+        $("snapshot-count").textContent = snapshots.length || (item.latest ? "1" : "0");
+        $("spa-mode").textContent = latest.spa ? "SPA" : "STATIC";
+        $("event-count").textContent = state.eventCount == null ? "—" : state.eventCount;
+        $("event-line-count").textContent = state.eventCount == null ? "0" : state.eventCount;
+        $("history-caption").textContent = snapshots.length ? `${snapshots.length} immutable` : "waiting for release";
+        $("snapshot-list").innerHTML = snapshots.length ? snapshots.map((snapshot, index) => `<div class="snapshot-row${index === 0 ? " is-latest" : ""}"><span class="snapshot-dot" aria-hidden="true"></span><code class="snapshot-id">${escapeHtml(snapshot.snapshot_id)}</code><span class="snapshot-date">${escapeHtml(formatDate(snapshot.created_at))}</span><a class="snapshot-link" href="${slugPath(item.page, `${encodeURIComponent(snapshot.snapshot_id)}/`)}" target="_blank" rel="noreferrer" aria-label="Open snapshot ${escapeHtml(snapshot.snapshot_id)}">↗</a></div>`).join("") : '<p style="color:var(--muted-dark);font-size:12px">No snapshot history yet.</p>';
+      }
+
+      async function loadDetails(page, requestId) {
+        try {
+          const item = state.pages.find((entry) => entry.page === page);
+          const snapshotsPromise = item && Array.isArray(item._snapshots)
+            ? Promise.resolve(item._snapshots)
+            : readJson(`/api/v0/pages/${encodeURIComponent(page)}/snapshots`);
+          const [snapshots, eventCount] = await Promise.all([snapshotsPromise, readEvents(page)]);
+          if (requestId !== state.request || state.selected !== page) return;
+          state.snapshots = Array.isArray(snapshots) ? snapshots : [];
+          state.eventCount = eventCount;
+          if (item && state.snapshots[0]) { item._spa = !!state.snapshots[0].spa; item._snapshots = state.snapshots; }
+          renderList();
+          renderDossier();
+        } catch (error) {
+          if (requestId !== state.request) return;
+          state.snapshots = [];
+          state.eventCount = null;
+          renderDossier();
+          $("event-count").textContent = "—";
+          announce(`Could not load details for ${page}`);
+        }
+      }
+
+      function selectProject(page) {
+        if (!state.pages.some((item) => item.page === page)) return;
+        state.selected = page;
+        state.snapshots = [];
+        state.eventCount = null;
+        state.request += 1;
+        renderList();
+        renderDossier();
+        announce(`Selected ${page}`);
+        loadDetails(page, state.request);
+      }
+
+      async function loadPages({ announceResult = false } = {}) {
+        state.loading = true;
+        state.request += 1;
+        const requestId = state.request;
+        setHost("Reading project index", "loading");
+        renderLoading();
+        try {
+          const pages = await readJson("/api/v0/pages");
+          if (requestId !== state.request) return;
+          const pageRecords = Array.isArray(pages) ? pages.map((item) => ({ ...item, _spa: false, _recent: false, _snapshots: [] })) : [];
+          const enriched = await Promise.all(pageRecords.map(async (item) => {
+            try {
+              const snapshots = await readJson(`/api/v0/pages/${encodeURIComponent(item.page)}/snapshots`);
+              return { ...item, _snapshots: Array.isArray(snapshots) ? snapshots : [], _spa: !!snapshots?.[0]?.spa };
+            } catch (_) {
+              return item;
+            }
+          }));
+          if (requestId !== state.request) return;
+          const ranked = [...enriched].sort((a, b) => String(b._snapshots?.[0]?.created_at || "").localeCompare(String(a._snapshots?.[0]?.created_at || "")));
+          const recentPages = new Set(ranked.slice(0, 5).map((item) => item.page));
+          state.pages = enriched.map((item) => ({ ...item, _recent: recentPages.has(item.page) }));
+          state.pages.sort((a, b) => a.page.localeCompare(b.page));
+          setHost(state.pages.length ? "Host online · index ready" : "Host online · no pages yet");
+          if (!state.selected || !state.pages.some((item) => item.page === state.selected)) state.selected = state.pages[0]?.page || null;
+          renderList();
+          if (!state.pages.length) $("orbit-empty").hidden = true;
+          if (state.selected) { renderDossier(); await loadDetails(state.selected, requestId); } else showDossierEmpty();
+          if (announceResult) announce("Project index refreshed");
+        } catch (error) {
+          if (requestId !== state.request) return;
+          state.pages = [];
+          state.selected = null;
+          setHost("Host unavailable · retry to reconnect", "error");
+          list.innerHTML = '<div class="error-field" role="listitem"><div><strong>Could not read the host</strong><p>The local API did not answer. Check the daemon, then try again.</p><button class="ghost-button inline-retry" type="button" id="inline-retry">Retry</button></div></div>';
+          $("result-count").textContent = "error";
+          $("page-count").textContent = "—";
+          $("orbit-empty").hidden = false;
+          $("orbit-empty").textContent = "host unavailable";
+          showDossierEmpty();
+          $("inline-retry").addEventListener("click", () => loadPages({ announceResult: true }));
+          announce("Host unavailable");
+        } finally {
+          state.loading = false;
+        }
+      }
+
+      $("refresh-button").addEventListener("click", () => loadPages({ announceResult: true }));
+      $("search-input").addEventListener("input", (event) => { state.query = event.target.value; renderList(); });
+      $("search-input").addEventListener("keydown", (event) => { if (event.key === "Escape") { event.target.value = ""; state.query = ""; renderList(); event.target.blur(); } });
+      document.querySelectorAll("[data-filter]").forEach((tab) => tab.addEventListener("click", () => {
+        state.filter = tab.dataset.filter;
+        document.querySelectorAll("[data-filter]").forEach((candidate) => { const active = candidate === tab; candidate.classList.toggle("is-active", active); candidate.setAttribute("aria-selected", String(active)); });
+        renderList();
+      }));
+      $("copy-url").addEventListener("click", async (event) => { const url = event.currentTarget.dataset.url; if (!url) return; try { await navigator.clipboard.writeText(url); event.currentTarget.textContent = "Copied"; event.currentTarget.classList.add("is-copied"); announce("Latest URL copied"); setTimeout(() => { event.currentTarget.textContent = "Copy URL"; event.currentTarget.classList.remove("is-copied"); }, 1800); } catch (_) { announce("Copy is unavailable in this browser"); } });
+      $("copy-command").addEventListener("click", async (event) => { const command = $("publish-command").textContent; try { await navigator.clipboard.writeText(command); event.currentTarget.textContent = "Copied"; event.currentTarget.classList.add("is-copied"); announce("Publish command copied"); setTimeout(() => { event.currentTarget.textContent = "Copy command"; event.currentTarget.classList.remove("is-copied"); }, 1800); } catch (_) { announce("Copy is unavailable in this browser"); } });
+      $("host-address").textContent = window.location.host || "127.0.0.1";
+      loadPages();
+    })();
+  </script>
+</body>
+</html>

@@ -15,9 +15,10 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    process::Stdio,
+    process::{Child, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -25,6 +26,7 @@ use tokio::sync::oneshot;
 
 const PROTOCOL: &str = "v0";
 const DEFAULT_PORT: u16 = 7777;
+const ATLAS_HTML: &str = include_str!("../assets/atlas.html");
 
 #[derive(Parser, Debug)]
 #[command(name = "pageville", version)]
@@ -211,8 +213,11 @@ fn valid_slug(s: &str) -> bool {
         && s != "api"
         && s != "latest"
 }
-fn snapshot_hash(manifest: &SnapshotManifest) -> String {
-    let bytes = serde_json::to_vec(manifest).expect("manifest serializable");
+fn snapshot_hash(page: &str, manifest: &SnapshotManifest) -> String {
+    // Keep the storage key globally unique even when two pages publish the
+    // same files. Object hashes remain page-independent; only the snapshot
+    // namespace is page-qualified.
+    let bytes = serde_json::to_vec(&(page, manifest)).expect("manifest serializable");
     blake3::hash(&bytes).to_hex().to_string()[..12].to_string()
 }
 fn ensure_object(data: &FsPath, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -254,30 +259,83 @@ async fn health_at(target: Option<&str>) -> bool {
         .map(|r| r.status().is_success())
         .unwrap_or(false)
 }
+
+struct StartLock {
+    _file: fs::File,
+}
+
+fn try_start_lock(data: &FsPath) -> Result<Option<StartLock>, String> {
+    let path = data.join("daemon.lock");
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("cannot open daemon lock: {e}"))?;
+    match file.try_lock() {
+        Ok(()) => {
+            file.set_len(0)
+                .and_then(|_| writeln!(file, "{}", std::process::id()))
+                .map_err(|e| format!("cannot update daemon lock: {e}"))?;
+            Ok(Some(StartLock { _file: file }))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot acquire daemon lock: {e}")),
+    }
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+    value: String,
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if fs::read_to_string(&self.path)
+            .ok()
+            .is_some_and(|value| value.trim() == self.value)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 async fn ensure_daemon(target: Option<&str>) -> Result<(), String> {
     if health_at(target).await {
         return Ok(());
     }
     let data = data_dir();
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-    let lock = data.join("daemon.lock");
-    let acquired = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .is_ok();
-    if acquired {
-        let exe = env::current_exe().map_err(|e| e.to_string())?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("daemon")
-            .arg("run")
-            .env("PAGEVILLE_DATA_DIR", &data)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null());
-        cmd.spawn().map_err(|e| e.to_string())?;
-    }
+    let mut child: Option<Child> = None;
+    let mut start_lock = try_start_lock(&data)?;
     for _ in 0..50 {
+        if health_at(target).await {
+            return Ok(());
+        }
+        if start_lock.is_none() {
+            start_lock = try_start_lock(&data)?;
+            if start_lock.is_some() && health_at(target).await {
+                return Ok(());
+            }
+        }
+        if start_lock.is_some() && child.is_none() {
+            let exe = env::current_exe().map_err(|e| e.to_string())?;
+            let spawned = std::process::Command::new(exe)
+                .arg("daemon")
+                .arg("run")
+                .env("PAGEVILLE_DATA_DIR", &data)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn();
+            child = Some(spawned.map_err(|e| e.to_string())?);
+        }
+        if let Some(c) = child.as_mut() {
+            if let Ok(Some(_)) = c.try_wait() {
+                return Err("daemon exited before becoming healthy".into());
+            }
+        }
         if health_at(target).await {
             return Ok(());
         }
@@ -375,28 +433,30 @@ async fn cmd_events(
     version: Option<String>,
     target: Option<String>,
 ) -> Result<(), String> {
+    if !valid_slug(&page) {
+        return Err("invalid page slug".into());
+    }
     ensure_daemon(target.as_deref()).await?;
-    let mut u = format!(
+    let mut u = reqwest::Url::parse(&format!(
         "{}/api/v0/pages/{}/events",
         base_url(target.as_deref()),
         page
-    );
-    let mut qs = Vec::new();
-    if let Some(v) = session {
-        qs.push(format!("session={}", v));
-    }
-    if let Some(v) = since {
-        qs.push(format!("since={}", v));
-    }
-    if let Some(v) = until {
-        qs.push(format!("until={}", v));
-    }
-    if let Some(v) = version {
-        qs.push(format!("version={}", v));
-    }
-    if !qs.is_empty() {
-        u.push('?');
-        u.push_str(&qs.join("&"));
+    ))
+    .map_err(|e| e.to_string())?;
+    {
+        let mut query = u.query_pairs_mut();
+        if let Some(v) = session.as_deref() {
+            query.append_pair("session", v);
+        }
+        if let Some(v) = since.as_deref() {
+            query.append_pair("since", v);
+        }
+        if let Some(v) = until.as_deref() {
+            query.append_pair("until", v);
+        }
+        if let Some(v) = version.as_deref() {
+            query.append_pair("version", v);
+        }
     }
     let txt = reqwest::get(u)
         .await
@@ -452,7 +512,7 @@ async fn api_publish(
         }
         manifest.files.insert(path, hash);
     }
-    let id = snapshot_hash(&manifest);
+    let id = snapshot_hash(&page, &manifest);
     let created = Utc::now().to_rfc3339();
     let raw = serde_json::to_string(&manifest).unwrap();
     if fs::create_dir_all(st.data.join("manifests")).is_err()
@@ -484,11 +544,53 @@ async fn api_publish(
                 .into_response()
         }
     };
-    let _ = tx.execute(
-        "INSERT OR IGNORE INTO snapshots(id,page,created_at,spa,manifest) VALUES(?1,?2,?3,?4,?5)",
-        params![id, page, created, manifest.spa as i32, raw],
-    );
-    let _ = tx.execute("INSERT INTO pages(page,latest) VALUES(?1,?2) ON CONFLICT(page) DO UPDATE SET latest=excluded.latest", params![page, id]);
+    if tx
+        .execute(
+            "INSERT OR IGNORE INTO snapshots(id,page,created_at,spa,manifest) VALUES(?1,?2,?3,?4,?5)",
+            params![&id, &page, &created, manifest.spa as i32, &raw],
+        )
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"snapshot write failed"})),
+        )
+            .into_response();
+    }
+    let existing = match tx.query_row(
+        "SELECT page,manifest FROM snapshots WHERE id=?1",
+        [&id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"snapshot write failed"})),
+            )
+                .into_response()
+        }
+    };
+    if existing.0 != page || existing.1 != raw {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"snapshot id collision"})),
+        )
+            .into_response();
+    }
+    if tx
+        .execute(
+            "INSERT INTO pages(page,latest) VALUES(?1,?2) ON CONFLICT(page) DO UPDATE SET latest=excluded.latest",
+            params![&page, &id],
+        )
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"latest update failed"})),
+        )
+            .into_response();
+    }
     if tx.commit().is_err() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -633,6 +735,16 @@ async fn api_event_get(
 async fn api_health() -> impl IntoResponse {
     Json(json!({"status":"ok", "protocol":"v0"}))
 }
+
+async fn atlas_root() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(ATLAS_HTML))
+        .expect("static atlas response is valid")
+}
 async fn api_context(
     State(st): State<AppState>,
     Query(q): Query<ContextQuery>,
@@ -697,20 +809,20 @@ async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Res
     if rel.starts_with('/') || rel.contains("..") {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let hash = manifest.files.get(&rel).or_else(|| {
-        if manifest.spa {
-            manifest.files.get("index.html")
-        } else {
-            None
-        }
-    });
-    let Some(hash) = hash else {
+    let (served_rel, hash) = if let Some(hash) = manifest.files.get(&rel) {
+        (rel.clone(), hash.clone())
+    } else if manifest.spa {
+        let Some(hash) = manifest.files.get("index.html") else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        ("index.html".to_owned(), hash.clone())
+    } else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Ok(bytes) = fs::read(st.data.join("objects").join(hash)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let mime = mime_guess::from_path(&rel).first_or_octet_stream();
+    let mime = mime_guess::from_path(&served_rel).first_or_octet_stream();
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -736,15 +848,24 @@ async fn api_shutdown(State(st): State<AppState>) -> impl IntoResponse {
 async fn run_daemon() -> Result<(), String> {
     let data = data_dir();
     fs::create_dir_all(data.join("objects")).map_err(|e| e.to_string())?;
+    if health_at(None).await {
+        return Err("daemon already running".into());
+    }
     let _ = db(&data).map_err(|e| e.to_string())?;
     let (tx, rx) = oneshot::channel();
-    fs::write(data.join("daemon.pid"), std::process::id().to_string())
-        .map_err(|e| e.to_string())?;
+    let pid_path = data.join("daemon.pid");
+    let pid_value = std::process::id().to_string();
+    fs::write(&pid_path, &pid_value).map_err(|e| e.to_string())?;
+    let _pid_guard = PidFileGuard {
+        path: pid_path,
+        value: pid_value,
+    };
     let state = AppState {
         data: data.clone(),
         shutdown: Arc::new(Mutex::new(Some(tx))),
     };
     let app = Router::new()
+        .route("/", get(atlas_root))
         .route("/api/v0/health", get(api_health))
         .route("/api/v0/pages", get(api_pages))
         .route(
@@ -768,8 +889,6 @@ async fn run_daemon() -> Result<(), String> {
             let _ = rx.await;
         })
         .await;
-    let _ = fs::remove_file(data.join("daemon.pid"));
-    let _ = fs::remove_file(data.join("daemon.lock"));
     result.map_err(|e| e.to_string())
 }
 

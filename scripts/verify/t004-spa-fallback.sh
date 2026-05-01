@@ -17,6 +17,7 @@ publish "$tmp_dir/spa" spa --spa >/dev/null
 publish "$tmp_dir/plain" plain >/dev/null
 test "$(curl -fsS "http://127.0.0.1:${port}/spa/deep/link")" = '<h1>spa-index</h1>'
 test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/plain/deep/link")" = 404
+curl -fsSI "http://127.0.0.1:${port}/spa/deep/link" | grep -qi 'content-type: text/html'
 curl -fsSI "http://127.0.0.1:${port}/spa/app.css" | grep -qi 'content-type: text/css'
 curl -fsSI "http://127.0.0.1:${port}/spa/app.js" | grep -qi 'content-type: text/javascript\|content-type: application/javascript'
 curl -fsSI "http://127.0.0.1:${port}/spa/data.bin" | grep -qi 'content-type: application/octet-stream'

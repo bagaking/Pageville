@@ -14,6 +14,9 @@ CLI 和 loopback daemon，把页面发布成不可变快照，并为页面与 Ag
   稳定的 `snapshot_id`。
 - **稳定 URL**：`/{page}/` 和 `/{page}/latest/` 指向最新快照，
   `/{page}/{snapshot_id}/` 永久钉住历史版本。
+- **Atlas 项目大厅**：打开 `/` 可浏览已发布页面（以项目呈现）、查看最新快照、
+  历史版本与事件数量，并直接打开或复制稳定 URL；大厅本身随单二进制内嵌，
+  不依赖前端构建或外部字体。
 - **SPA 与 MIME**：发布时可启用 `--spa`；未命中文件回落到同一快照的
   `index.html`，其他请求返回 404；响应按扩展名推断 MIME。
 - **HITL 事件闭环**：页面追加写入统一事件 envelope，Agent 可按会话、时间和
@@ -45,6 +48,9 @@ printf '<h1>Hello Pageville</h1>\n' > site/index.html
 
 # 访问最新快照
 curl -i http://127.0.0.1:7777/demo/
+
+# 打开项目大厅
+open http://127.0.0.1:7777/
 
 # 完成后停止本地 daemon
 ./target/release/pageville daemon stop
@@ -92,6 +98,7 @@ pageville events pull --page demo --session review-1
 
 | URL | 含义 |
 | --- | --- |
+| `/` | Pageville Atlas 项目大厅（读取 `/api/v0/` 数据面） |
 | `/{page}/` | 当前 `latest` 快照的 `index.html` |
 | `/{page}/latest/<path>` | 当前 `latest` 快照中的指定文件 |
 | `/{page}/{snapshot_id}/<path>` | 指定不可变快照中的文件 |
@@ -126,8 +133,9 @@ curl -sS -X POST \
   -d '{"files":{"index.html":"PGgxPkhlbGxvPC9oMT4K"},"spa":false}'
 ```
 
-响应包含 `page`、`snapshot_id`、`url` 和 `spa`。相同文件内容与相同 SPA 标志
-会得到相同的快照 ID。
+响应包含 `page`、`snapshot_id`、`url` 和 `spa`。同一页面的相同文件内容与相同
+SPA 标志会得到相同的快照 ID；页面名也参与快照寻址，从而避免相同内容在不同
+页面之间产生快照主键冲突。
 
 ### 追加与读取事件
 
@@ -187,7 +195,8 @@ CAS 幂等、版本路由、SPA fallback、事件 envelope、CLI 面和 daemon �
 - 没有远程/self-host 端点、用户鉴权、局域网暴露或公网 CDN。
 - 没有快照 GC、保留策略、订阅/回调和内建 HITL 事件类型。
 - daemon 生命周期、存储迁移和协议兼容性仍以本地单机使用为目标；升级前应
-  备份数据目录。
+  备份数据目录。daemon lock 采用进程级文件锁，进程崩溃后锁会由操作系统释放，
+  后续启动不会被遗留文件名卡住。
 - 当前验证以黑盒 shell 验收为主，后续可补充更细的 Rust 单元/集成测试和发布
   自动化。
 

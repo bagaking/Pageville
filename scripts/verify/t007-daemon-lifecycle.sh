@@ -12,8 +12,17 @@ for _ in $(seq 1 8); do run pages list >/dev/null & done
 wait
 test "$(run daemon status)" = running
 test "$(run --json daemon status | jq -r .protocol)" = v0
-pid_count="$(pgrep -f "pageville.*daemon run" | wc -l | tr -d ' ')"
-test "$pid_count" -eq 1
+daemon_pid="$(tr -d '[:space:]' < "$tmp_dir/data/daemon.pid")"
+test -n "$daemon_pid"
+kill -0 "$daemon_pid"
+ps -p "$daemon_pid" -o command= | grep -q 'pageville.*daemon run'
+run daemon stop
+for _ in $(seq 1 30); do test "$(run daemon status)" = stopped && break || sleep 0.1; done
+test "$(run daemon status)" = stopped
+printf 'stale-marker\n' > "$tmp_dir/data/daemon.lock"
+printf '999999\n' > "$tmp_dir/data/daemon.pid"
+run pages list >/dev/null
+test "$(run daemon status)" = running
 run daemon stop
 for _ in $(seq 1 30); do test "$(run daemon status)" = stopped && break || sleep 0.1; done
 test "$(run daemon status)" = stopped

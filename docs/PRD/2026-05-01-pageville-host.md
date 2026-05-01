@@ -60,6 +60,7 @@ Pageville 用**一个本地常驻服务**收敛以上全部问题：统一托管
 
 | 路由 | 语义 |
 |------|------|
+| `GET /` | 内嵌 Atlas 项目大厅：列出页面（项目）、最新快照、历史与事件概况 |
 | `GET /{page}/{version}/...path` | 钉住访问指定不可变快照内的文件 |
 | `GET /{page}/latest/...path` | 解析到当前最新快照（等价下行） |
 | `GET /{page}/...path` | ≡ `/{page}/latest/...path`（省略版本段默认 latest） |
@@ -97,7 +98,14 @@ pageville --target <url> ...                       # 协议端点切换（v0 默
 - `publish`、`pages`、`versions`、`events` 和 `daemon start` 首次调用时若 daemon 未运行则自动拉起；`daemon status` 只探测状态，`daemon stop` 只请求退出。auto-start 必须幂等（并发调用只产生一个 daemon）。
 - 输出面向程序化消费：`--json` 全局旗标输出结构化结果；`events pull` 默认 NDJSON。
 
-### 5.5 协议 / `--target`
+### 5.5 Atlas 项目大厅
+
+根页面 `/` 是只读的本地管理入口，不引入第二套 Project 数据模型：现有 `page`
+记录在界面中以“项目”呈现。它调用 `GET /api/v0/pages`、选中项目的 snapshots
+与 events 接口，提供搜索、SPA 筛选、最新/历史 URL、复制操作和 CLI 发布命令
+提示。发布仍由 CLI 完成；API 失败、空目录和移动端状态均有显式反馈。
+
+### 5.6 协议 / `--target`
 
 - CLI 与 daemon 之间的 loopback HTTP/JSON API 即协议本体，路径前缀 `/api/v0/` 承载协议版本标识（论坛硬约束）。
 - `--target` v0 仅接受并校验参数（默认 `http://127.0.0.1:<port>`），行为上只支持 loopback；协议报文预留 `identity` 占位字段（v0 恒空），供未来 remote target 鉴权使用。
@@ -134,14 +142,14 @@ pageville --target <url> ...                       # 协议端点切换（v0 默
 ### 7.1 快照（snapshot）
 
 ```text
-snapshot_id : 快照内容派生 id（manifest 的 blake3 hash，取前 12 位十六进制展示）
+snapshot_id : 快照内容派生 id（page + manifest 的 blake3 hash，取前 12 位十六进制展示）
 page        : 页面 slug
 created_at  : RFC 3339 时间戳
 spa         : bool（SPA fallback 开关，随快照固化）
 manifest    : { "<relative-path>": "<object-hash>", ... }
 ```
 
-- `snapshot_id` 由内容派生 → 完全相同的重复发布天然幂等（同 id）。
+- `snapshot_id` 由页面名与 manifest 共同派生 → 同一页面完全相同的重复发布天然幂等（同 id）；页面名参与寻址，避免相同内容在不同页面之间产生全局主键冲突。
 - 快照一经写入不可变。发布顺序是先写全部对象与 manifest，再在事务中登记 snapshot 并切 latest；崩溃时最坏只丢失未完成的发布，不产生半新半旧。
 
 ### 7.2 latest 别名
@@ -197,7 +205,7 @@ CLI 是协议的第一个客户端，不走任何私有通道。全部功能经 
 2. **版本语义**：发布两个不同版本后，`/demo/` 与 `/demo/latest/` 内容一致且为 v2；`/demo/{v1-id}/` 仍返回 v1 内容；重复发布相同内容得到相同 snapshot_id。
 3. **原子 latest**：发布过程中并发请求 `/demo/`，任一响应要么全旧要么全新（无 404 / 混合内容窗口）。
 4. **事件闭环**：向 `/api/v0/pages/demo/events` POST 事件后，`pageville events pull --page demo --session <s>` 能按 session / 时间 / 版本过滤拉回，envelope 的 `version` 为快照 id 本体（即使写入方经 `/demo/` 访问）。
-5. **daemon 生命周期**：daemon 未运行时数据命令与 `daemon start` 自动拉起；并发调用只产生一个 daemon 实例；`pageville daemon status` 可探测状态，`pageville daemon stop` 干净退出。
+5. **daemon 生命周期**：daemon 未运行时数据命令与 `daemon start` 自动拉起；并发调用只产生一个 daemon 实例；启动失败或崩溃后遗留的 `daemon.lock` 不会阻塞后续启动；`pageville daemon status` 可探测状态，`pageville daemon stop` 干净退出。
 6. **SPA fallback**：`--spa` 发布的页面，未命中路径回落 `index.html`；非 SPA 页面未命中返回 404。
 7. **协议面**：所有 CLI 功能均经 `/api/v0/` HTTP 完成；`--target http://127.0.0.1:<port>` 显式传入时行为不变。
 

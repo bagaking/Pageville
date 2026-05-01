@@ -33,4 +33,10 @@ test "$(curl -fsS "http://127.0.0.1:${port}/api/v0/pages/demo/events?version=${i
 since="$(printf '%s' "$ev2" | jq -r .ts)"
 encoded_since="${since//+/%2B}"
 test "$(curl -fsS "http://127.0.0.1:${port}/api/v0/pages/demo/events?since=${encoded_since}&until=${encoded_since}" | jq -r .payload.kind)" = new
+special_session='session&part=+1'
+ev3="$(post "{\"version\":\"$id2\",\"session\":\"$special_session\",\"payload\":{\"kind\":\"special\"}}")"
+test "$(printf '%s' "$ev3" | jq -r .session)" = "$special_session"
+test "$(PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- events pull --page demo --session "$special_session" | jq -r .payload.kind)" = special
+special_ts="$(printf '%s' "$ev3" | jq -r .ts)"
+test "$(PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- events pull --page demo --since "$special_ts" --until "$special_ts" | jq -r .payload.kind | tail -n 1)" = special
 echo 'PASS: append-only event envelopes, snapshot version context, and filters'

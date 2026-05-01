@@ -8,13 +8,16 @@ trap 'PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quie
 mkdir -p "$tmp_dir/site"
 printf 'same-content\n' > "$tmp_dir/site/index.html"
 
-publish() { PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- publish "$tmp_dir/site" --page demo; }
-id1="$(publish | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
-id2="$(publish | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+publish() { PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- publish "$tmp_dir/site" --page "$1"; }
+id1="$(publish demo | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+id2="$(publish demo | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
 test -n "$id1" && test "$id1" = "$id2"
 count_before="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
+id_other="$(publish other | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+test -n "$id_other" && test "$id_other" != "$id1"
+test "$(curl -fsS "http://127.0.0.1:${port}/other/")" = 'same-content'
 printf 'changed-content\n' > "$tmp_dir/site/index.html"
-id3="$(publish | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+id3="$(publish demo | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
 test "$id3" != "$id1"
 count_after="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
 test "$count_after" -gt "$count_before"

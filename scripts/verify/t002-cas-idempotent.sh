@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+tmp_dir="$(mktemp -d)"
+port="${PAGEVILLE_PORT:-17778}"
+trap 'PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- daemon stop >/dev/null 2>&1 || true; rm -rf "$tmp_dir"' EXIT
+mkdir -p "$tmp_dir/site"
+printf 'same-content\n' > "$tmp_dir/site/index.html"
+
+publish() { PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- publish "$tmp_dir/site" --page demo; }
+id1="$(publish | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+id2="$(publish | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+test -n "$id1" && test "$id1" = "$id2"
+count_before="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
+printf 'changed-content\n' > "$tmp_dir/site/index.html"
+id3="$(publish | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
+test "$id3" != "$id1"
+count_after="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
+test "$count_after" -gt "$count_before"
+test -f "$tmp_dir/data/manifests/$id1.json" && test -f "$tmp_dir/data/manifests/$id3.json"
+echo 'PASS: CAS objects, manifest files, and content-derived snapshot ids are idempotent'

@@ -10,3 +10,8 @@
 /.tmp/
 /.codex/
 /.bagakit/
+/.claude/
+
+# Generated npm package contents. CI stages one native binary per supported
+# target before running `npm publish`.
+/prebuilds/

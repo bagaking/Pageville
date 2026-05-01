@@ -1,0 +1,33 @@
+{
+  "name": "pageville",
+  "version": "0.1.0",
+  "description": "Local-first static page host and HITL event daemon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bagaking/Pageville.git"
+  },
+  "homepage": "https://github.com/bagaking/Pageville#readme",
+  "bugs": {
+    "url": "https://github.com/bagaking/Pageville/issues"
+  },
+  "bin": {
+    "pageville": "bin/pageville.js"
+  },
+  "files": [
+    "bin",
+    "prebuilds",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "npm run npm:check",
+    "npm:check": "node scripts/npm/check.js",
+    "npm:build": "node scripts/npm/build.js",
+    "npm:stage": "node scripts/npm/stage.js",
+    "npm:verify": "node scripts/npm/verify.js"
+  }
+}

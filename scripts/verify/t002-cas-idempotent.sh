@@ -21,5 +21,8 @@ id3="$(publish demo | sed -n 's/.*snapshot_id=\([^ ]*\).*/\1/p')"
 test "$id3" != "$id1"
 count_after="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
 test "$count_after" -gt "$count_before"
-test -f "$tmp_dir/data/manifests/$id1.json" && test -f "$tmp_dir/data/manifests/$id3.json"
-echo 'PASS: CAS objects, manifest files, and content-derived snapshot ids are idempotent'
+# The manifest lives in SQLite (snapshots.manifest) and is read back from
+# there; assert the snapshot resolves rather than that a redundant file exists.
+test "$(curl -fsS "http://127.0.0.1:${port}/demo/${id1}/")" = 'same-content'
+test "$(curl -fsS "http://127.0.0.1:${port}/demo/${id3}/")" = 'changed-content'
+echo 'PASS: CAS objects, snapshot manifests, and content-derived snapshot ids are idempotent'

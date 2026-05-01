@@ -1,13 +1,14 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -202,6 +203,10 @@ fn db(data: &FsPath) -> rusqlite::Result<Connection> {
     fs::create_dir_all(data).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let conn = Connection::open(db_path(data))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // WAL still serializes writers. With the default 0ms timeout an overlapping
+    // publish and event POST makes the loser fail instantly with SQLITE_BUSY,
+    // dropping a legitimate write that a brief wait would have landed.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS pages(page TEXT PRIMARY KEY, latest TEXT NOT NULL); CREATE TABLE IF NOT EXISTS snapshots(id TEXT PRIMARY KEY, page TEXT NOT NULL, created_at TEXT NOT NULL, spa INTEGER NOT NULL, manifest TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, page TEXT NOT NULL, version TEXT NOT NULL, session TEXT NOT NULL, ts TEXT NOT NULL, identity TEXT, payload TEXT NOT NULL);")?;
     Ok(conn)
 }
@@ -212,6 +217,42 @@ fn valid_slug(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && s != "api"
         && s != "latest"
+}
+/// True when `s` has the shape of a snapshot id (12 lowercase-or-upper hex).
+/// Shape alone is not enough to route as a version — see `serve_page`, which
+/// also requires the snapshot to exist so a real file of the same name wins.
+fn looks_like_version(s: &str) -> bool {
+    s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+/// Compare event timestamps as instants, not bytes. The stored `ts` is always
+/// `+00:00`, but a caller may legitimately pass `...Z` or a `+08:00` offset for
+/// the very same moment; a lexicographic compare silently drops those events.
+/// Falls back to string ordering only when the bound is unparseable.
+/// Compare stored stamp against a bound as instants. Bounds are validated at
+/// the request boundary, so an unparseable one never reaches here; stored
+/// stamps are host-generated RFC3339. Unparseable input sorts as excluded
+/// rather than silently falling back to byte order.
+fn ts_before(ts: &str, bound: &str) -> bool {
+    match (parse_ts(ts), parse_ts(bound)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+fn ts_after(ts: &str, bound: &str) -> bool {
+    match (parse_ts(ts), parse_ts(bound)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Accept a bare `YYYY-MM-DDTHH:MM:SS[.fff]` bound as UTC, which is what a
+    // user naturally types after copying a ts and trimming the offset.
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .map(|n| n.and_utc())
 }
 fn snapshot_hash(page: &str, manifest: &SnapshotManifest) -> String {
     // Keep the storage key globally unique even when two pages publish the
@@ -254,10 +295,36 @@ fn snapshot_for_page(
 }
 
 async fn health_at(target: Option<&str>) -> bool {
-    reqwest::get(format!("{}/api/v0/health", base_url(target)))
+    // A short timeout matters: without it a foreign process that accepts the
+    // connection but never answers hangs the CLI forever instead of failing.
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{}/api/v0/health", base_url(target)))
+        .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
+}
+
+/// Client for CLI -> daemon calls. Every request is bounded so a wedged or
+/// foreign listener surfaces as an error rather than an indefinite hang.
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Port the daemon will listen on for `target`, so auto-start binds the same
+/// port the caller is probing. `None` when the target is not a loopback URL.
+fn target_port(target: Option<&str>) -> Option<u16> {
+    let url = reqwest::Url::parse(target?).ok()?;
+    url.port_or_known_default()
 }
 
 struct StartLock {
@@ -321,19 +388,31 @@ async fn ensure_daemon(target: Option<&str>) -> Result<(), String> {
         }
         if start_lock.is_some() && child.is_none() {
             let exe = env::current_exe().map_err(|e| e.to_string())?;
-            let spawned = std::process::Command::new(exe)
-                .arg("daemon")
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("daemon")
                 .arg("run")
-                .env("PAGEVILLE_DATA_DIR", &data)
+                .env("PAGEVILLE_DATA_DIR", &data);
+            // The child must bind the very port we are probing. Without this a
+            // custom --target port spawns a daemon on the default port, so the
+            // probe never converges and the stray daemon is orphaned.
+            if let Some(p) = target_port(target) {
+                cmd.env("PAGEVILLE_PORT", p.to_string());
+            }
+            // Keep the child's stderr so a bind failure (EADDRINUSE) is
+            // reportable instead of vanishing into /dev/null.
+            let spawned = cmd
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .stdin(Stdio::null())
                 .spawn();
             child = Some(spawned.map_err(|e| e.to_string())?);
         }
         if let Some(c) = child.as_mut() {
             if let Ok(Some(_)) = c.try_wait() {
-                return Err("daemon exited before becoming healthy".into());
+                return Err(format!(
+                    "daemon exited before becoming healthy{}",
+                    child_stderr_hint(child.as_mut(), target)
+                ));
             }
         }
         if health_at(target).await {
@@ -341,7 +420,38 @@ async fn ensure_daemon(target: Option<&str>) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err("daemon did not become healthy".into())
+    Err(format!(
+        "daemon did not become healthy{}",
+        child_stderr_hint(child.as_mut(), target)
+    ))
+}
+
+/// Best-effort detail for a failed auto-start: the child's own error line, or
+/// a port hint when something else already holds the address.
+fn child_stderr_hint(child: Option<&mut Child>, target: Option<&str>) -> String {
+    let mut detail = String::new();
+    if let Some(c) = child {
+        if let Some(mut err) = c.stderr.take() {
+            let mut buf = String::new();
+            if std::io::Read::read_to_string(&mut err, &mut buf).is_ok() {
+                let line = buf.trim();
+                if !line.is_empty() {
+                    detail = format!(": {}", line.lines().last().unwrap_or(line));
+                }
+            }
+        }
+    }
+    if detail.is_empty() {
+        return String::new();
+    }
+    let p = target_port(target).unwrap_or_else(port);
+    if detail.contains("Address already in use") || detail.contains("os error 48") {
+        return format!(
+            "{} (port {} is already in use; stop that process or set PAGEVILLE_PORT)",
+            detail, p
+        );
+    }
+    detail
 }
 
 async fn cmd_publish(
@@ -355,7 +465,7 @@ async fn cmd_publish(
     ensure_daemon(target.as_deref()).await?;
     let mut files = BTreeMap::new();
     collect_files(&args.dir, &args.dir, &mut files).map_err(|e| e.to_string())?;
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let req = PublishRequest {
         files,
         spa: args.spa,
@@ -391,9 +501,21 @@ fn collect_files(
     for ent in fs::read_dir(dir)? {
         let ent = ent?;
         let p = ent.path();
-        if p.is_dir() {
+        // file_type() from the DirEntry does NOT follow symlinks (unlike
+        // p.is_file()). A link inside the published dir pointing at, say,
+        // ~/.ssh/id_rsa would otherwise be dereferenced and its contents
+        // uploaded into the CAS and served over HTTP. Skip links entirely.
+        let ft = ent.file_type()?;
+        if ft.is_symlink() {
+            eprintln!(
+                "warning: skipping symlink {} (publishing follows no links)",
+                p.display()
+            );
+            continue;
+        }
+        if ft.is_dir() {
             collect_files(root, &p, out)?;
-        } else if p.is_file() {
+        } else if ft.is_file() {
             let rel = p
                 .strip_prefix(root)
                 .unwrap()
@@ -458,12 +580,23 @@ async fn cmd_events(
             query.append_pair("version", v);
         }
     }
-    let txt = reqwest::get(u)
-        .await
-        .map_err(|e| e.to_string())?
-        .text()
+    let resp = http_client()?
+        .get(u)
+        .send()
         .await
         .map_err(|e| e.to_string())?;
+    // Without this an error body prints as if it were the event stream and the
+    // CLI exits 0, so a scripted caller cannot tell a rejected query from an
+    // empty one.
+    let status = resp.status();
+    let txt = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&txt)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| txt.trim().to_string());
+        return Err(format!("{status}: {detail}"));
+    }
     print!("{}", txt);
     Ok(())
 }
@@ -515,15 +648,6 @@ async fn api_publish(
     let id = snapshot_hash(&page, &manifest);
     let created = Utc::now().to_rfc3339();
     let raw = serde_json::to_string(&manifest).unwrap();
-    if fs::create_dir_all(st.data.join("manifests")).is_err()
-        || fs::write(st.data.join("manifests").join(format!("{}.json", id)), &raw).is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"manifest write failed"})),
-        )
-            .into_response();
-    }
     let conn = match db(&st.data) {
         Ok(c) => c,
         Err(_) => {
@@ -694,6 +818,20 @@ async fn api_event_get(
     let Ok(conn) = db(&st.data) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
     };
+    // An unparseable bound must not silently filter. Falling back to string
+    // order here would answer "no events" for a typo, and a caller cannot tell
+    // that apart from a genuinely empty range.
+    for (name, raw) in [("since", &q.since), ("until", &q.until)] {
+        if let Some(v) = raw {
+            if parse_ts(v).is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("{name} must be an RFC3339 timestamp")})),
+                )
+                    .into_response();
+            }
+        }
+    }
     let mut stmt = match conn.prepare(
         "SELECT event_id,version,session,ts,payload FROM events WHERE page=?1 ORDER BY ts,event_id",
     ) {
@@ -718,8 +856,8 @@ async fn api_event_get(
     for row in rows.flatten() {
         if q.session.as_ref().is_some_and(|v| v != &row.session)
             || q.version.as_ref().is_some_and(|v| v != &row.version)
-            || q.since.as_ref().is_some_and(|v| &row.ts < v)
-            || q.until.as_ref().is_some_and(|v| &row.ts > v)
+            || q.since.as_ref().is_some_and(|v| ts_before(&row.ts, v))
+            || q.until.as_ref().is_some_and(|v| ts_after(&row.ts, v))
         {
             continue;
         }
@@ -733,7 +871,75 @@ async fn api_event_get(
         .unwrap()
 }
 async fn api_health() -> impl IntoResponse {
-    Json(json!({"status":"ok", "protocol":"v0"}))
+    Json(json!({"status":"ok", "protocol":"v0", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+/// Reject requests whose Host is not our own loopback address.
+///
+/// The daemon binds 127.0.0.1, but that alone is not a trust boundary: any web
+/// page the user visits can reach it, and with a rebound DNS name (attacker.com
+/// -> 127.0.0.1) the browser treats the response as same-origin and hands the
+/// attacker every page's HITL payloads. A literal-loopback Host cannot be
+/// produced by a rebinding attack, so pinning it closes that door.
+async fn guard_host(req: Request, next: Next) -> Response {
+    let expected = port();
+    let ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| host_is_loopback(h, expected));
+    if !ok {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"host not allowed; use 127.0.0.1 or localhost"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn host_is_loopback(host: &str, expected_port: u16) -> bool {
+    // Split off the port, tolerating the bracketed IPv6 form.
+    let (name, port_part) = match host.rsplit_once(':') {
+        Some((n, p)) if !n.ends_with(']') || p.chars().all(|c| c.is_ascii_digit()) => (n, Some(p)),
+        _ => (host, None),
+    };
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    let name_ok = name == "127.0.0.1" || name == "localhost" || name == "::1";
+    let port_ok = match port_part {
+        Some(p) => p.parse::<u16>().is_ok_and(|p| p == expected_port),
+        None => expected_port == 80,
+    };
+    name_ok && port_ok
+}
+
+/// Block cross-site writes. A state-changing POST with no JSON body is a CORS
+/// "simple request", so a hostile page can submit it with no preflight to stop
+/// it; that is a drive-by kill switch for `/shutdown`. Same-origin callers
+/// either send no Origin or send ours.
+fn origin_is_same(req: &Request) -> bool {
+    let Some(origin) = req.headers().get(header::ORIGIN) else {
+        return true; // non-browser clients (the CLI) send none
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|o| reqwest::Url::parse(o).ok())
+        .is_some_and(|u| {
+            let host_ok = matches!(u.host_str(), Some("127.0.0.1") | Some("localhost"));
+            host_ok && u.port_or_known_default() == Some(port())
+        })
+}
+
+async fn guard_write_origin(req: Request, next: Next) -> Response {
+    if !origin_is_same(&req) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"cross-origin write rejected"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 async fn atlas_root() -> Response {
@@ -761,7 +967,9 @@ async fn api_context(
     let page = parts[0];
     let version = match parts.get(1).copied() {
         Some("latest") | None => None,
-        Some(v) if v.len() == 12 && v.chars().all(|c| c.is_ascii_hexdigit()) => Some(v),
+        // Same existence rule as serve_page: a path segment shaped like a
+        // snapshot id only counts as one if that snapshot exists.
+        Some(v) if looks_like_version(v) => Some(v),
         _ => None,
     };
     let Some((id, _)) = snapshot_for_page(&st.data, page, version) else {
@@ -788,14 +996,16 @@ async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Res
             Some((i, m)) => (i, m, 2),
             None => return StatusCode::NOT_FOUND.into_response(),
         }
-    } else if parts
+    } else if let Some((i, m)) = parts
         .get(1)
-        .is_some_and(|v| v.len() == 12 && v.chars().all(|c| c.is_ascii_hexdigit()))
+        .filter(|v| looks_like_version(v))
+        // Shape alone must not claim the segment: a published file or dir
+        // named like a snapshot id (hashed asset names look exactly like
+        // this) would otherwise be permanently unreachable. Only route as a
+        // version when that snapshot really exists for this page.
+        .and_then(|v| snapshot_for_page(&st.data, page, Some(v)))
     {
-        match snapshot_for_page(&st.data, page, parts.get(1).copied()) {
-            Some((i, m)) => (i, m, 2),
-            None => return StatusCode::NOT_FOUND.into_response(),
-        }
+        (i, m, 2)
     } else {
         match snapshot_for_page(&st.data, page, None) {
             Some((i, m)) => (i, m, 1),
@@ -823,11 +1033,32 @@ async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Res
         return StatusCode::NOT_FOUND.into_response();
     };
     let mime = mime_guess::from_path(&served_rel).first_or_octet_stream();
+    // Text types need an explicit charset or the browser guesses, which
+    // mojibakes any non-ASCII page (CJK content is the common case here).
+    let content_type = match (mime.type_(), mime.subtype()) {
+        (mime_guess::mime::TEXT, _)
+        | (_, mime_guess::mime::JAVASCRIPT)
+        | (_, mime_guess::mime::JSON) => format!("{}; charset=utf-8", mime),
+        _ => mime.to_string(),
+    };
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(mime.as_ref()).unwrap(),
+        HeaderValue::from_str(&content_type).unwrap(),
+    );
+    // Published pages are user content sharing one origin with the API and
+    // with each other. nosniff stops a mislabelled upload from being run as
+    // script; the CSP keeps a page from reaching outside the host.
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; frame-ancestors 'self'",
+        ),
     );
     response
         .headers_mut()
@@ -877,8 +1108,12 @@ async fn run_daemon() -> Result<(), String> {
             post(api_event_post).get(api_event_get),
         )
         .route("/api/v0/context", get(api_context))
-        .route("/api/v0/shutdown", post(api_shutdown))
+        .route(
+            "/api/v0/shutdown",
+            post(api_shutdown).layer(middleware::from_fn(guard_write_origin)),
+        )
         .route("/*path", get(serve_page))
+        .layer(middleware::from_fn(guard_host))
         .with_state(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port()));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -940,15 +1175,18 @@ async fn main() {
             if !health_at(cli.target.as_deref()).await {
                 Ok(())
             } else {
-                reqwest::Client::new()
-                    .post(format!(
-                        "{}/api/v0/shutdown",
-                        base_url(cli.target.as_deref())
-                    ))
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())
-                    .map(|_| ())
+                match http_client() {
+                    Err(e) => Err(e),
+                    Ok(client) => client
+                        .post(format!(
+                            "{}/api/v0/shutdown",
+                            base_url(cli.target.as_deref())
+                        ))
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())
+                        .map(|_| ()),
+                }
             }
         }
     };
@@ -959,7 +1197,9 @@ async fn main() {
 }
 
 async fn futuresless_get(url: String, json_out: bool) -> Result<(), String> {
-    let text = reqwest::get(url)
+    let text = http_client()?
+        .get(url)
+        .send()
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()
@@ -981,4 +1221,113 @@ async fn futuresless_get(url: String, json_out: bool) -> Result<(), String> {
         print!("{}", text);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_rules() {
+        assert!(valid_slug("demo"));
+        assert!(valid_slug("my-page-2"));
+        assert!(!valid_slug(""));
+        assert!(!valid_slug("Bad_Name"));
+        assert!(!valid_slug("UPPER"));
+        assert!(!valid_slug("api"), "reserved");
+        assert!(!valid_slug("latest"), "reserved");
+        assert!(!valid_slug(&"a".repeat(129)), "too long");
+        assert!(valid_slug(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn version_shape() {
+        assert!(looks_like_version("a1b2c3d4e5f6"));
+        assert!(looks_like_version("0123456789ab"));
+        assert!(!looks_like_version("a1b2c3d4e5f"), "11 chars");
+        assert!(!looks_like_version("a1b2c3d4e5f6a"), "13 chars");
+        assert!(!looks_like_version("g1b2c3d4e5f6"), "non-hex");
+        assert!(!looks_like_version("index.html"));
+    }
+
+    #[test]
+    fn timestamps_compare_as_instants_not_strings() {
+        let stored = "2026-09-13T11:00:00+00:00";
+        // Same instant, three spellings: none may change the answer.
+        for bound in [
+            "2026-09-13T11:00:00+00:00",
+            "2026-09-13T11:00:00Z",
+            "2026-09-13T19:00:00+08:00",
+        ] {
+            assert!(!ts_before(stored, bound), "{bound} must not be after");
+            assert!(!ts_after(stored, bound), "{bound} must not be before");
+        }
+        // A +08:00 bound that is EARLIER in absolute time sorts LATER as a
+        // string; this is the regression that silently dropped events.
+        let until = "2026-09-13T18:00:00+08:00"; // == 10:00Z, before stored
+        assert!(ts_after(stored, until), "11:00Z is after 10:00Z");
+        assert!(stored < until, "string compare disagrees (the old bug)");
+        assert!(ts_before("2026-09-13T09:00:00Z", stored));
+        // Unparseable bounds never reach the comparators (rejected at the
+        // request boundary) and must not resurrect byte ordering here: a typo
+        // that silently answers "no events" is worse than an error.
+        assert!(!ts_before("2026-01-01T00:00:00+00:00", "zzz"));
+        assert!(!ts_after("2026-01-01T00:00:00+00:00", "zzz"));
+        assert!(parse_ts("zzz").is_none());
+        assert!(parse_ts("").is_none());
+        // Both spellings a caller may reasonably type do parse.
+        assert!(parse_ts("2026-09-13T11:00:00Z").is_some());
+        assert!(parse_ts("2026-09-13T11:00:00").is_some());
+    }
+
+    #[test]
+    fn host_guard_pins_loopback() {
+        assert!(host_is_loopback("127.0.0.1:7777", 7777));
+        assert!(host_is_loopback("localhost:7777", 7777));
+        assert!(host_is_loopback("[::1]:7777", 7777));
+        // The rebinding case: attacker name resolving to 127.0.0.1.
+        assert!(!host_is_loopback("evil.example:7777", 7777));
+        assert!(!host_is_loopback("evil.example", 7777));
+        // Right name, wrong port is still not us.
+        assert!(!host_is_loopback("127.0.0.1:9999", 7777));
+        assert!(!host_is_loopback("127.0.0.1", 7777), "missing port");
+    }
+
+    #[test]
+    fn target_port_drives_child_bind() {
+        assert_eq!(target_port(Some("http://127.0.0.1:8888")), Some(8888));
+        assert_eq!(target_port(Some("http://localhost:8080/")), Some(8080));
+        assert_eq!(target_port(Some("http://127.0.0.1")), Some(80));
+        assert_eq!(target_port(None), None);
+    }
+
+    #[test]
+    fn loopback_targets_only() {
+        assert!(validate_target(None).is_ok());
+        assert!(validate_target(Some("http://127.0.0.1:7777")).is_ok());
+        assert!(validate_target(Some("http://localhost:7777")).is_ok());
+        assert!(validate_target(Some("http://example.com:7777")).is_err());
+        assert!(validate_target(Some("https://127.0.0.1:7777")).is_err());
+    }
+
+    #[test]
+    fn snapshot_id_is_page_scoped_and_stable() {
+        let m = SnapshotManifest {
+            files: BTreeMap::from([("index.html".into(), "hash".into())]),
+            spa: false,
+        };
+        let a = snapshot_hash("one", &m);
+        assert_eq!(a, snapshot_hash("one", &m), "same input, same id");
+        assert_ne!(a, snapshot_hash("two", &m), "page must qualify the id");
+        assert_eq!(a.len(), 12);
+        let spa = SnapshotManifest {
+            spa: true,
+            ..m.clone()
+        };
+        assert_ne!(
+            a,
+            snapshot_hash("one", &spa),
+            "spa flag is part of identity"
+        );
+    }
 }

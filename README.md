@@ -26,7 +26,8 @@ CLI 和 loopback daemon，把页面发布成不可变快照，并为页面与 Ag
 
 ## 快速开始
 
-需要 Rust stable、`curl`；运行验收脚本还需要 `jq`。
+从源码构建需要 Rust stable 和 `curl`；使用 npm 预编译包只需要 Node.js（>=18）
+和 `curl`。运行验收脚本还需要 `jq`。
 
 也可以把二进制安装到 Cargo 的本地 bin 目录：
 
@@ -34,6 +35,20 @@ CLI 和 loopback daemon，把页面发布成不可变快照，并为页面与 Ag
 cargo install --path .
 pageville --version
 ```
+
+如果不想在目标机器上安装 Rust，也可以直接使用 npm 分发的预编译版本：
+
+```bash
+npm install --global pageville
+pageville --version
+npx pageville publish site --page demo
+```
+
+npm 包内置各平台的 Rust 二进制，安装时不会执行 `cargo`，也不会在
+`postinstall` 阶段联网下载文件。当前发布矩阵为 macOS（Intel/Apple Silicon）、
+Linux（x64/arm64，glibc 和 musl）以及 Windows（x64）。Node 启动器根据
+`process.platform`、`process.arch` 和 Linux libc 自动选择对应文件；不支持的平台会
+给出明确错误。`PAGEVILLE_BINARY=/path/to/pageville` 可在开发或打包时临时覆盖选择。
 
 ```bash
 # 构建
@@ -93,6 +108,11 @@ pageville events pull --page demo --session review-1
 
 页面 slug 只允许小写字母、数字和连字符，长度不超过 128，且不能使用
 `api` 或 `latest`。
+
+`--target` 指向一个 loopback 端点（`http://127.0.0.1:<port>` 或 `localhost`），
+非回环地址会被拒绝。它同时决定自动启动的 daemon 绑定哪个端口——即
+`--target http://127.0.0.1:8888` 会把新 daemon 拉起在 8888，而不是拉起在默认端口
+后连不上。若该端口已被占用，CLI 会在错误里点明端口冲突。
 
 ## URL 与版本模型
 
@@ -165,15 +185,36 @@ curl -sS \
 ```text
 <data-dir>/
 ├── objects/       # BLAKE3 内容对象
-├── manifests/     # 快照 manifest
-├── pageville.db   # SQLite 元数据与事件（WAL）
+├── pageville.db   # SQLite 元数据与事件（WAL，快照 manifest 存于此）
 ├── daemon.pid
 └── daemon.lock
 ```
 
 daemon 固定 bind `127.0.0.1`，v0 不提供鉴权；不要把端口转发到局域网或公网。
-快照内的文件路径必须是相对路径，服务端会拒绝绝对路径和目录穿越片段。事件 payload
-不做业务语义校验，也不会自动脱敏，调用方应避免写入秘密或个人敏感信息。
+
+由于 daemon 监听在回环地址，而浏览器里的任意网页都能向回环地址发请求，v0 对
+「浏览器可达」这一面做了几道固定防线：
+
+- **Host 校验**：只接受 `127.0.0.1`、`localhost`、`::1` 且端口匹配的 `Host`
+  请求头，其余一律 403。这挡住 DNS rebinding——恶意域名解析到 127.0.0.1 后，
+  请求仍带着它自己的 Host，因而被拒。
+- **写操作的 Origin 校验**：`POST /api/v0/shutdown` 要求 `Origin` 同源；跨源
+  页面无法关掉你的 daemon。CLI 不带 `Origin`，因此不受影响。
+- **响应头加固**：页面响应带 `X-Content-Type-Options: nosniff`、限制到 `self`
+  的 `Content-Security-Policy`（含 `frame-ancestors 'self'`），文本类型统一
+  显式声明 `charset=utf-8`，避免 MIME 嗅探和跨页面嵌套。
+
+发布侧的边界：
+
+- 快照内的文件路径必须是相对路径，服务端会拒绝绝对路径和目录穿越片段。
+- **`publish` 不跟随符号链接**：遇到符号链接（文件、目录或链接环）会跳过并在
+  stderr 打印 warning。否则一个指向 `~/.ssh/id_rsa` 的链接就会被发布成公开可读
+  的页面资源。需要包含链接目标时，请先自行复制成真实文件。
+- 单次发布有大小上限：请求体经 Base64 编码（膨胀 4/3）后受 2 MiB 限制，
+  对应原始内容约 1.5 MiB，超出会得到 `413 Payload Too Large`。v0 不适合发布
+  大体积媒体资源。
+
+事件 payload 不做业务语义校验，也不会自动脱敏，调用方应避免写入秘密或个人敏感信息。
 
 ## 验证与开发
 
@@ -184,9 +225,37 @@ cargo test --all-targets
 bash scripts/verify/t008-acceptance.sh
 ```
 
-`t008-acceptance.sh` 会在各自的临时数据目录中串行执行七个验收切片，覆盖发布、
-CAS 幂等、版本路由、SPA fallback、事件 envelope、CLI 面和 daemon 生命周期。
-单项脚本可用于定位失败：`t001` 到 `t007` 的名称对应上述能力顺序。
+### 构建与发布 npm 包
+
+本地可先构建当前 Rust target 并把二进制放入 npm 包目录：
+
+```bash
+npm run npm:build -- --target "$(rustc -vV | sed -n 's/^host: //p')"
+npm run npm:check
+node bin/pageville.js --version
+npm pack
+```
+
+`npm run npm:verify` 用于发布前的完整检查，要求 `prebuilds/` 下已经放入矩阵中的
+全部目标；GitHub Actions 会在发布 job 中自动执行它。
+
+交叉编译时先安装目标对应的 Rust linker；Linux 目标也可以使用
+[`cross`](https://github.com/cross-rs/cross)：
+
+```bash
+PAGEVILLE_BUILD_TOOL=cross npm run npm:build -- --target aarch64-unknown-linux-gnu
+```
+
+给 `v0.1.0`（版本号必须与 `Cargo.toml` 和 `package.json` 一致）打 tag 后，
+`.github/workflows/npm-release.yml` 会在 GitHub Actions 中并行构建所有目标，校验
+每个二进制并发布 GitHub Release 与同版本 npm 包。发布前需要在仓库 Secrets 中配置
+`NPM_TOKEN`；工作流不会把 `prebuilds/` 生成物提交回源码仓库。
+
+`t008-acceptance.sh` 会在各自的临时数据目录中串行执行十一个验收切片，覆盖发布、
+CAS 幂等、版本路由（含并发发布下的原子 `latest`）、SPA fallback、事件 envelope、
+CLI 面、daemon 生命周期、Atlas 大厅，以及三个回归切片：符号链接不外泄、
+浏览器可达面的 Host/Origin/响应头防线、hex 命名资源的路由与时间过滤。
+任一切片失败都会立即中止并打印切片名和退出码。单项脚本可用于定位失败。
 
 ## 当前限制与后续方向
 
@@ -206,5 +275,7 @@ CAS 幂等、版本路由、SPA fallback、事件 envelope、CLI 面和 daemon �
 
 提交变更前请运行格式化、编译和完整验收。提交信息应描述一个清晰的意图边界，
 不要把本地运行日志、构建产物、`.tmp`、`.codex` 或 `.bagakit` 运行时文件加入
-产品提交。许可证和公开发布流程尚未在 v0 中声明；在对外分发前应由项目维护者
-补充相应政策。
+产品提交。
+
+本项目以 MIT 许可证发布，见 [`LICENSE`](LICENSE)。`Cargo.toml`、`package.json`
+与 `LICENSE` 三处声明由 `npm run npm:check` 强制保持一致。

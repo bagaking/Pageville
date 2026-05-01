@@ -1,0 +1,12 @@
+.worktrees
+
+# Rust build output and local runtime state.
+/target/
+/.pageville/
+
+# Agent/session-generated workspace material is intentionally not part of the
+# product source tree.  Keep it local so generated logs cannot enter a release
+# commit accidentally.
+/.tmp/
+/.codex/
+/.bagakit/

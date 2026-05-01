@@ -179,6 +179,10 @@ fn port() -> u16 {
     env::var("PAGEVILLE_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
+        // Port 0 parses fine but means "any free port" to the OS, so the child
+        // binds something random while every caller keeps probing :0. Treat it
+        // as unset: a reachable default beats an unreachable daemon.
+        .filter(|p| *p != 0)
         .unwrap_or(DEFAULT_PORT)
 }
 fn base_url(target: Option<&str>) -> String {
@@ -227,11 +231,9 @@ fn looks_like_version(s: &str) -> bool {
 /// Compare event timestamps as instants, not bytes. The stored `ts` is always
 /// `+00:00`, but a caller may legitimately pass `...Z` or a `+08:00` offset for
 /// the very same moment; a lexicographic compare silently drops those events.
-/// Falls back to string ordering only when the bound is unparseable.
-/// Compare stored stamp against a bound as instants. Bounds are validated at
-/// the request boundary, so an unparseable one never reaches here; stored
-/// stamps are host-generated RFC3339. Unparseable input sorts as excluded
-/// rather than silently falling back to byte order.
+/// Bounds are validated at the request boundary, so an unparseable one never
+/// reaches here; unparseable input excludes rather than falling back to byte
+/// order, which is the bug this exists to prevent.
 fn ts_before(ts: &str, bound: &str) -> bool {
     match (parse_ts(ts), parse_ts(bound)) {
         (Some(a), Some(b)) => a < b,
@@ -243,6 +245,18 @@ fn ts_after(ts: &str, bound: &str) -> bool {
         (Some(a), Some(b)) => a > b,
         _ => false,
     }
+}
+/// Reject traversal by path COMPONENT, not by substring. `contains("..")` also
+/// rejects legal names like `app.2..1.js` or `config..bak`, failing the whole
+/// publish with a misleading "invalid path". A component check still catches
+/// real traversal (`a/../b`, a leading `../`) and additionally rejects a bare
+/// `.` component and backslashes.
+fn safe_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && p.split('/')
+            .all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
 }
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
@@ -265,9 +279,23 @@ fn ensure_object(data: &FsPath, hash: &str, bytes: &[u8]) -> std::io::Result<()>
     let dir = data.join("objects");
     fs::create_dir_all(&dir)?;
     let path = dir.join(hash);
-    if !path.exists() {
-        fs::write(path, bytes)?;
+    // Trust an existing object only if its size matches. A crash mid-write
+    // leaves a truncated file that `exists()` alone would accept forever,
+    // silently serving half a page. Size is enough here because the name is
+    // the content hash: same name + same length means same bytes.
+    if path.metadata().is_ok_and(|m| m.len() == bytes.len() as u64) {
+        return Ok(());
     }
+    // Write to a temp file and rename so a crash can never publish a partial
+    // object under its final name. The temp name needs a per-CALL suffix, not
+    // just the pid: concurrent publishes of identical content run as threads of
+    // ONE daemon process, so a pid-only name collides and the loser's rename
+    // fails with ENOENT after the winner renamed the shared temp away.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", hash, std::process::id(), seq));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
     Ok(())
 }
 fn snapshot_for_page(
@@ -431,6 +459,14 @@ async fn ensure_daemon(target: Option<&str>) -> Result<(), String> {
 fn child_stderr_hint(child: Option<&mut Child>, target: Option<&str>) -> String {
     let mut detail = String::new();
     if let Some(c) = child {
+        // Only read the pipe once the child is gone. A child that is alive but
+        // unreachable never closes its stderr, and `read_to_string` would block
+        // the CLI forever — an unbounded hang is worse than a missing hint.
+        let exited = matches!(c.try_wait(), Ok(Some(_)));
+        if !exited {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
         if let Some(mut err) = c.stderr.take() {
             let mut buf = String::new();
             if std::io::Read::read_to_string(&mut err, &mut buf).is_ok() {
@@ -529,7 +565,7 @@ fn collect_files(
 
 async fn cmd_pages(target: Option<String>, json_out: bool) -> Result<(), String> {
     ensure_daemon(target.as_deref()).await?;
-    futuresless_get(
+    print_list(
         format!("{}/api/v0/pages", base_url(target.as_deref())),
         json_out,
     )
@@ -537,7 +573,7 @@ async fn cmd_pages(target: Option<String>, json_out: bool) -> Result<(), String>
 }
 async fn cmd_versions(page: String, target: Option<String>, json_out: bool) -> Result<(), String> {
     ensure_daemon(target.as_deref()).await?;
-    futuresless_get(
+    print_list(
         format!(
             "{}/api/v0/pages/{}/snapshots",
             base_url(target.as_deref()),
@@ -580,24 +616,7 @@ async fn cmd_events(
             query.append_pair("version", v);
         }
     }
-    let resp = http_client()?
-        .get(u)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    // Without this an error body prints as if it were the event stream and the
-    // CLI exits 0, so a scripted caller cannot tell a rejected query from an
-    // empty one.
-    let status = resp.status();
-    let txt = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let detail = serde_json::from_str::<Value>(&txt)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(str::to_string))
-            .unwrap_or_else(|| txt.trim().to_string());
-        return Err(format!("{status}: {detail}"));
-    }
-    print!("{}", txt);
+    print!("{}", get_text(u).await?);
     Ok(())
 }
 
@@ -618,7 +637,7 @@ async fn api_publish(
         spa: req.spa,
     };
     for (path, encoded) in req.files {
-        if path.is_empty() || path.starts_with('/') || path.contains("..") {
+        if !safe_rel_path(&path) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error":"invalid path"})),
@@ -1013,10 +1032,16 @@ async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Res
         }
     };
     let mut rel = parts.get(rel_start..).unwrap_or(&[]).join("/");
+    // A directory-style URL (`/page/sub/`) leaves a trailing empty segment.
+    // That is ordinary, not traversal, so resolve it to the directory index
+    // before the path check rejects the empty component.
+    if rel.ends_with('/') {
+        rel.push_str("index.html");
+    }
     if rel.is_empty() {
         rel = "index.html".into();
     }
-    if rel.starts_with('/') || rel.contains("..") {
+    if !safe_rel_path(&rel) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let (served_rel, hash) = if let Some(hash) = manifest.files.get(&rel) {
@@ -1196,17 +1221,28 @@ async fn main() {
     }
 }
 
-async fn futuresless_get(url: String, json_out: bool) -> Result<(), String> {
-    let text = http_client()?
+/// GET a v0 endpoint, surfacing the server's `error` field on failure.
+/// `error_for_status` alone would discard it and report only the code.
+async fn get_text(url: impl reqwest::IntoUrl) -> Result<String, String> {
+    let resp = http_client()?
         .get(url)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .text()
-        .await
         .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| text.trim().to_string());
+        return Err(format!("{status}: {detail}"));
+    }
+    Ok(text)
+}
+
+async fn print_list(url: String, json_out: bool) -> Result<(), String> {
+    let text = get_text(url).await?;
     if json_out {
         println!("{}", text);
     } else if let Ok(v) = serde_json::from_str::<Value>(&text) {
@@ -1226,6 +1262,42 @@ async fn futuresless_get(url: String, json_out: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_zero_falls_back() {
+        // Port 0 means "any free port" to the OS: the daemon would bind a
+        // random port while every caller probed :0, hanging unboundedly.
+        std::env::set_var("PAGEVILLE_PORT", "0");
+        assert_eq!(port(), DEFAULT_PORT);
+        std::env::set_var("PAGEVILLE_PORT", "abc");
+        assert_eq!(port(), DEFAULT_PORT);
+        std::env::set_var("PAGEVILLE_PORT", "18123");
+        assert_eq!(port(), 18123);
+        std::env::remove_var("PAGEVILLE_PORT");
+        assert_eq!(port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn traversal_is_rejected_by_component_not_substring() {
+        // Real traversal stays rejected.
+        assert!(!safe_rel_path("../etc/passwd"));
+        assert!(!safe_rel_path("a/../../b"));
+        assert!(!safe_rel_path("a/.."));
+        assert!(!safe_rel_path("/abs/path"));
+        assert!(!safe_rel_path(""));
+        assert!(!safe_rel_path("a//b"), "empty component");
+        assert!(!safe_rel_path("./a"), "bare dot component");
+        assert!(!safe_rel_path("a\\..\\b"), "backslash separator");
+        // Legal names that merely CONTAIN `..` must publish (the bug: these
+        // failed the whole snapshot with a misleading "invalid path").
+        assert!(safe_rel_path("data..old.json"));
+        assert!(safe_rel_path("app.2..1.js"));
+        assert!(safe_rel_path("..lead"));
+        assert!(safe_rel_path("trail.."));
+        assert!(safe_rel_path("dir/a..b/file.txt"));
+        assert!(safe_rel_path("index.html"));
+        assert!(safe_rel_path(".env"));
+    }
 
     #[test]
     fn slug_rules() {

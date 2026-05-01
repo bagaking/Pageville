@@ -33,4 +33,24 @@ if grep -rqa 'SECRET-CANARY-DO-NOT-PUBLISH' "$tmp_dir/data" 2>/dev/null; then
   exit 1
 fi
 
+# Traversal is rejected per path COMPONENT, not by substring: a legal filename
+# that merely contains `..` must publish and serve, while real traversal stays
+# blocked. The substring check failed the ENTIRE snapshot on `data..old.json`.
+mkdir -p "$tmp_dir/dots/sub"
+printf 'ROOT\n' > "$tmp_dir/dots/index.html"
+printf 'OLD\n' > "$tmp_dir/dots/data..old.json"
+printf 'LEAD\n' > "$tmp_dir/dots/..lead"
+printf 'NESTED\n' > "$tmp_dir/dots/sub/a..b.txt"
+run publish "$tmp_dir/dots" --page dots >/dev/null
+test "$(curl -fsS "http://127.0.0.1:${port}/dots/data..old.json")" = 'OLD'
+test "$(curl -fsS "http://127.0.0.1:${port}/dots/..lead")" = 'LEAD'
+test "$(curl -fsS "http://127.0.0.1:${port}/dots/sub/a..b.txt")" = 'NESTED'
+# Real traversal, on both the publish and the serve side, is still refused.
+for bad in '../etc/passwd' 'a/../../b' '/abs' 'a//b' './x'; do
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${port}/api/v0/pages/dots/snapshots" \
+    -H 'content-type: application/json' -d "{\"files\":{\"$bad\":\"eA==\"},\"spa\":false}")"
+  test "$code" = 400 || { echo "FAIL: publish accepted traversal path '$bad' ($code)" >&2; exit 1; }
+done
+test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/dots/%2e%2e%2f%2e%2e%2fetc%2fpasswd")" = 400
+
 echo 'PASS: publish skips symlinks; linked secrets never enter the CAS or the HTTP surface'

@@ -45,4 +45,41 @@ for _ in $(seq 1 30); do test "$(run daemon status)" = stopped && break || sleep
 test "$(run daemon status)" = stopped
 run publish "$tmp_dir/site" --page restart-demo >/dev/null
 test "$(run daemon status)" = running
+
+# PAGEVILLE_PORT=0 parses as a valid u16 but means "any free port" to the OS:
+# the child bound something random while the parent probed :0 forever, hanging
+# the CLI unboundedly and orphaning a live daemon on every invocation. It must
+# now fall back to the default port and terminate promptly.
+#
+# The fallback target is the default 7777, so this check is skipped (loudly,
+# never silently) when something already listens there — publishing into a
+# developer's real daemon would be worse than losing one assertion. The pure
+# fallback rule itself is covered by the `port_zero_falls_back` unit test.
+if curl -fsS -m 2 "http://127.0.0.1:7777/api/v0/health" >/dev/null 2>&1; then
+  echo '  (skipping PAGEVILLE_PORT=0 check: a daemon already holds 7777)'
+else
+  zero_dir="$tmp_dir/zero"
+  mkdir -p "$zero_dir/site"
+  printf 'ZERO\n' > "$zero_dir/site/index.html"
+  PAGEVILLE_DATA_DIR="$zero_dir/data" PAGEVILLE_PORT=0 \
+    cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- \
+    publish "$zero_dir/site" --page zeroport >/dev/null 2>&1 &
+  zero_pid=$!
+  waited=0
+  while kill -0 "$zero_pid" 2>/dev/null && [ "$waited" -lt 60 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$zero_pid" 2>/dev/null; then
+    kill -9 "$zero_pid" 2>/dev/null || true
+    PAGEVILLE_DATA_DIR="$zero_dir/data" \
+      cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- daemon stop >/dev/null 2>&1 || true
+    echo 'FAIL: PAGEVILLE_PORT=0 hung the CLI instead of falling back' >&2
+    exit 1
+  fi
+  wait "$zero_pid" 2>/dev/null || true
+  PAGEVILLE_DATA_DIR="$zero_dir/data" \
+    cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- daemon stop >/dev/null 2>&1 || true
+fi
+
 echo 'PASS: idempotent auto-start, health protocol, clean stop, and restart'

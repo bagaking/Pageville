@@ -49,17 +49,17 @@
 
 ### 最近一次全量质检结果
 
-> 执行环境：macOS 本机 Defender 拦截 `exec`，新编译的二进制无法启动（见 O-016）。
-> 需要跑二进制的两项改在 **Linux 容器**内执行——CI 本来就是 `ubuntu-latest`，
-> 这是忠实复现 CI，不是降低标准。
+> 执行环境：`macOS` 与 **Linux 容器**双平台各跑一遍。当时本机 Defender 拦 `exec`
+> 导致只能在容器内验（见 O-016），`syspolicyd` 重启后本机恢复，已补跑原生确认。
+> 两个平台结果一致。
 
 | 项 | 结果 | 环境 |
 | --- | --- | --- |
-| `cargo fmt --check` | 通过 | host |
-| `cargo clippy --all-targets --locked -- -D warnings` | 0 警告 | host |
-| `cargo test --locked` | 10/10 | 容器 |
+| `cargo fmt --check` | 通过 | macOS |
+| `cargo clippy --all-targets --locked -- -D warnings` | 0 警告 | macOS |
+| `cargo test --locked` | 10/10 | **macOS + 容器** |
 | `node scripts/npm/check.js` | 通过（`pageville@0.1.0; 7 runtimes`） | 容器 |
-| `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0**（限流交替对照 10/10 次） | 容器 |
+| `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0** | **macOS + 容器**（容器限流交替对照 10/10 次） |
 | O-002 mutation 验证 | `/health` 泄露断言**确认会红**（点名 4 个字段） | 容器 |
 | 60 线程并发发布相同内容 | 0 个 5xx，无残留 tmp | 容器 |
 
@@ -73,11 +73,10 @@
   （常见负载回收 0.2%，代价是 pinned URL 静默返回 200 配错内容）。已改为把体积
   通过 `daemon status` 暴露给所有者。真要做的三个必要条件记录在该文件末尾。
 - CI 尚未在真实 push 上触发过。
-- **本机验收能力受限（非项目缺陷）**：macOS 上 Microsoft Defender 的 Endpoint
-  Security 扩展拦截 `exec`，**任何新链接的二进制都无法启动**（`int main(){return 0;}`
-  同样挂死在 `_dyld_start`，有界等待 122 秒确认是真挂死）。绕开方式是在 Linux
-  容器内跑门禁（见下方「三、整体质检步骤」的容器命令），**不是**降低标准。
-  重启可清除 `syspolicyd` 空转。
+- **本机验收能力（已恢复）**：`syspolicyd` 空转期间 Microsoft Defender 的 Endpoint
+  Security 扩展拦 `exec`，**任何新链接的二进制都无法启动**（`int main(){return 0;}`
+  同样挂死在 `_dyld_start`，有界等待 122 秒确认是真挂死）。`syspolicyd` 重启后已恢复，
+  原生 macOS 补跑 10/10 + 12/12 通过。**再次遇到时**：走下方容器命令，不是降低标准。
 - 许可证 MIT（依赖树核查无传染性协议，见 PLAN.md）。
 
 ## 三、整体质检步骤（每次重大变更后执行）

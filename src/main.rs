@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process::{Child, Stdio},
@@ -361,7 +360,11 @@ struct StartLock {
 
 fn try_start_lock(data: &FsPath) -> Result<Option<StartLock>, String> {
     let path = data.join("daemon.lock");
-    let mut file = fs::OpenOptions::new()
+    // The file's CONTENT is deliberately empty: the lock is the OS advisory
+    // flock held by the open handle, and writing a pid here only ever recorded
+    // the short-lived CLI that won the race, not the daemon. Nothing reads it,
+    // so a stale pid was pure misinformation for anyone inspecting the dir.
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -369,12 +372,7 @@ fn try_start_lock(data: &FsPath) -> Result<Option<StartLock>, String> {
         .open(path)
         .map_err(|e| format!("cannot open daemon lock: {e}"))?;
     match file.try_lock() {
-        Ok(()) => {
-            file.set_len(0)
-                .and_then(|_| writeln!(file, "{}", std::process::id()))
-                .map_err(|e| format!("cannot update daemon lock: {e}"))?;
-            Ok(Some(StartLock { _file: file }))
-        }
+        Ok(()) => Ok(Some(StartLock { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot acquire daemon lock: {e}")),
     }

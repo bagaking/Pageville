@@ -257,6 +257,42 @@ fn safe_rel_path(p: &str) -> bool {
         && p.split('/')
             .all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
 }
+/// Total bytes and count of stored objects. Skips the `.tmp` files an
+/// in-flight publish may be writing so the number never jitters mid-publish.
+fn store_size(data: &FsPath) -> (u64, u64) {
+    let mut bytes = 0;
+    let mut count = 0;
+    if let Ok(entries) = fs::read_dir(data.join("objects")) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            if let Ok(m) = e.metadata() {
+                if m.is_file() {
+                    bytes += m.len();
+                    count += 1;
+                }
+            }
+        }
+    }
+    (bytes, count)
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{}{}", n, UNITS[0])
+    } else {
+        format!("{:.1}{}", v, UNITS[u])
+    }
+}
+
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
@@ -322,20 +358,26 @@ fn snapshot_for_page(
 }
 
 async fn health_at(target: Option<&str>) -> bool {
+    health_body(target).await.is_some()
+}
+
+/// The daemon's health body, or None when it is not reachable.
+async fn health_body(target: Option<&str>) -> Option<serde_json::Value> {
     // A short timeout matters: without it a foreign process that accepts the
     // connection but never answers hangs the CLI forever instead of failing.
-    let Ok(client) = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
-    else {
-        return false;
-    };
-    client
+        .ok()?;
+    let resp = client
         .get(format!("{}/api/v0/health", base_url(target)))
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
 }
 
 /// Client for CLI -> daemon calls. Every request is bounded so a wedged or
@@ -896,8 +938,20 @@ async fn api_event_get(
         .body(Body::from(body))
         .unwrap()
 }
-async fn api_health() -> impl IntoResponse {
-    Json(json!({"status":"ok", "protocol":"v0", "version": env!("CARGO_PKG_VERSION")}))
+/// Health doubles as the store report. The numbers must come from the daemon
+/// that owns the data, not from the caller's own `PAGEVILLE_DATA_DIR` — those
+/// are different directories whenever a client points at another daemon, and
+/// reading the caller's would report a confidently wrong 0.
+async fn api_health(State(st): State<AppState>) -> impl IntoResponse {
+    let (bytes, objects) = store_size(&st.data);
+    let snapshots = db(&st.data)
+        .and_then(|c| c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0)))
+        .unwrap_or(0);
+    Json(
+        json!({"status":"ok", "protocol":"v0", "version": env!("CARGO_PKG_VERSION"),
+                "data_dir": st.data, "object_bytes": bytes, "objects": objects,
+                "snapshots": snapshots}),
+    )
 }
 
 /// Reject requests whose Host is not our own loopback address.
@@ -1190,11 +1244,49 @@ async fn main() {
         Command::Daemon {
             command: DaemonCommand::Status,
         } => {
-            let ok = health_at(cli.target.as_deref()).await;
+            // Growth is entirely immutable snapshot history — nothing is
+            // collectable — so the honest intervention is to make the size
+            // visible and let the owner decide, not to delete history for them.
+            //
+            // Ask the running daemon: it owns the store. Falling back to the
+            // caller's own data dir when it is down keeps `status` useful
+            // offline, and that is the one case where the two agree.
+            let live = health_body(cli.target.as_deref()).await;
+            let ok = live.is_some();
+            let num = |k: &str| live.as_ref().and_then(|v| v[k].as_u64());
+            let local = data_dir();
+            let (local_bytes, local_objects) = store_size(&local);
+            let data = live
+                .as_ref()
+                .and_then(|v| v["data_dir"].as_str())
+                .map_or(local.clone(), PathBuf::from);
+            let bytes = num("object_bytes").unwrap_or(local_bytes);
+            let objects = num("objects").unwrap_or(local_objects);
+            let snapshots = num("snapshots").map(|n| n as i64).unwrap_or_else(|| {
+                db(&local)
+                    .and_then(|c| {
+                        c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0))
+                    })
+                    .unwrap_or(0)
+            });
             if cli.json {
-                println!("{}", json!({"running":ok,"protocol":PROTOCOL}));
+                println!(
+                    "{}",
+                    json!({"running": ok, "protocol": PROTOCOL, "data_dir": data,
+                           "object_bytes": bytes, "objects": objects, "snapshots": snapshots})
+                );
             } else {
+                // Line 1 is a contract: the bare word, nothing else, so
+                // `daemon status` stays usable as a shell predicate. Detail
+                // goes below it.
                 println!("{}", if ok { "running" } else { "stopped" });
+                println!(
+                    "data_dir={} objects={} snapshots={} size={}",
+                    data.display(),
+                    objects,
+                    snapshots,
+                    human_bytes(bytes)
+                );
             }
             Ok(())
         }
@@ -1327,6 +1419,31 @@ mod tests {
         assert!(!looks_like_version("a1b2c3d4e5f6a"), "13 chars");
         assert!(!looks_like_version("g1b2c3d4e5f6"), "non-hex");
         assert!(!looks_like_version("index.html"));
+    }
+
+    #[test]
+    fn store_size_counts_finished_objects_only() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(1023), "1023B");
+        assert_eq!(human_bytes(1024), "1.0KiB");
+        assert_eq!(human_bytes(200_002), "195.3KiB");
+        // Never shows a bare byte count once it crosses a unit: the whole
+        // point is that a growing store reads at a glance.
+        assert!(human_bytes(5 * 1024 * 1024 * 1024).ends_with("GiB"));
+
+        let root = std::env::temp_dir().join(format!("pageville-size-{}", std::process::id()));
+        let objects = root.join("objects");
+        let _ = fs::remove_dir_all(&root);
+        // A missing store is 0, not a panic: `daemon status` runs before any
+        // publish has created the directory.
+        assert_eq!(store_size(&root), (0, 0));
+        fs::create_dir_all(&objects).unwrap();
+        fs::write(objects.join("aa"), vec![b'x'; 100]).unwrap();
+        fs::write(objects.join("bb"), vec![b'y'; 23]).unwrap();
+        // An in-flight publish's temp file must not jitter the reported size.
+        fs::write(objects.join(".cc.1.2.tmp"), vec![b'z'; 9999]).unwrap();
+        assert_eq!(store_size(&root), (123, 2));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

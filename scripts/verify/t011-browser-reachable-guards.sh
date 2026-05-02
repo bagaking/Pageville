@@ -29,7 +29,7 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/api/v0/pages")" = 200
 #    hostile page can fire it with no preflight to stop it.
 test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Origin: https://evil.example' "$base/api/v0/shutdown")" = 403
 # The daemon is still alive after the rejected attempt.
-test "$(run daemon status)" = running
+test "$(run daemon status | head -1)" = running
 
 # 3. Served pages carry hardening headers and an explicit charset.
 headers="$(curl -fsSI "$base/guarded/")"
@@ -39,7 +39,7 @@ printf '%s\n' "$headers" | grep -qi 'content-type: text/html; charset=utf-8'
 
 # 4. The local CLI (no Origin header) can still stop the daemon.
 run daemon stop
-for _ in $(seq 1 30); do test "$(run daemon status)" = stopped && break || sleep 0.1; done
-test "$(run daemon status)" = stopped
+for _ in $(seq 1 30); do test "$(run daemon status | head -1)" = stopped && break || sleep 0.1; done
+test "$(run daemon status | head -1)" = stopped
 
 echo 'PASS: Host pinning blocks DNS rebinding, cross-origin shutdown is refused, pages carry nosniff/CSP/charset'

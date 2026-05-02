@@ -44,6 +44,7 @@
 | [M01_S01.002.FIX](M01_S01.002.FIX.data_integrity_and_cli.md) | 数据完整性 + CLI 契约 | **已验收** |
 | [M01_S01.003.FIX](M01_S01.003.FIX.adversarial_probe_findings.md) | 并发/文件系统/生命周期三面探测结论 | **已验收** |
 | [M01_S01.004.FIX](M01_S01.004.FIX.cas_growth_and_publish_ordering.md) | CAS 增长实测 + 发布顺序修复（GC 决策） | **已验收** |
+| [M01_S01.005.FIX](M01_S01.005.FIX.retention_decision_and_store_visibility.md) | 保留策略实测否决 + 存储体积可见化 | **已验收** |
 
 ### 最近一次全量质检结果
 
@@ -51,7 +52,7 @@
 | --- | --- |
 | `cargo fmt --check` | 通过 |
 | `cargo clippy --all-targets --locked -- -D warnings` | 0 警告 |
-| `cargo test --locked` | 9/9 |
+| `cargo test --locked` | 10/10 |
 | `node scripts/npm/check.js` | 通过 |
 | `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0（未经管道实测）** |
 | 60 线程并发发布相同内容 | 0 个 5xx，无残留 tmp |
@@ -61,6 +62,10 @@
 - 无 `project_plan` 之外的阻塞项。
 - **CAS GC：已决策不做**，理由见 [M01_S01.004](M01_S01.004.FIX.cas_growth_and_publish_ordering.md)
   （正常运行可回收垃圾实测为 0；真正的垃圾源已在上游消除）。
+- **保留策略（keep=N）：已决策不做**，理由见
+  [M01_S01.005](M01_S01.005.FIX.retention_decision_and_store_visibility.md)
+  （常见负载回收 0.2%，代价是 pinned URL 静默返回 200 配错内容）。已改为把体积
+  通过 `daemon status` 暴露给所有者。真要做的三个必要条件记录在该文件末尾。
 - CI 尚未在真实 push 上触发过。
 - 许可证 MIT（依赖树核查无传染性协议，见 PLAN.md）。
 
@@ -91,15 +96,18 @@ bash scripts/verify/t008-acceptance.sh   # 任一切片失败会点名并非零�
    （O-008，来源 M01_S01.003）
 8. 改动发布校验顺序后，确认被拒的发布不产生任何对象（校验先于写盘）。
    （O-010，已固化进 `t002`）
+9. 给既有命令加输出前，先 grep 谁在消费它；`daemon status` 第一行是裸词契约，
+   明细只能追加在后续行。（O-012，已固化进 `t007`/`t011`）
 
 ## 四、文档索引
 
 | 文件 | 内容 |
 | --- | --- |
 | [PLAN.md](PLAN.md) | 北极星、用户原话、技术选型、许可证决策 |
-| [OPINIONS_001.quality_bar.md](OPINIONS_001.quality_bar.md) | 质量基线与审美（O-001 ~ O-010） |
+| [OPINIONS_001.quality_bar.md](OPINIONS_001.quality_bar.md) | 质量基线与审美（O-001 ~ O-012） |
 | [M01_S01.001.FIX...](M01_S01.001.FIX.security_and_verification.md) | 安全加固与虚假验收修复 |
 | [M01_S01.002.FIX...](M01_S01.002.FIX.data_integrity_and_cli.md) | 数据完整性与 CLI 契约 |
 | [M01_S01.003.FIX...](M01_S01.003.FIX.adversarial_probe_findings.md) | 三面对抗探测结论 |
 | [M01_S01.004.FIX...](M01_S01.004.FIX.cas_growth_and_publish_ordering.md) | CAS 增长实测与 GC 决策 |
+| [M01_S01.005.FIX...](M01_S01.005.FIX.retention_decision_and_store_visibility.md) | 保留策略否决与体积可见化 |
 | [../docs/PRD/](../docs/PRD/2026-05-01-pageville-host.md) | **产品范围与验收标准 SSOT** |

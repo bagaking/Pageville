@@ -191,6 +191,10 @@ curl -sS \
 └── daemon.lock
 ```
 
+POSIX 系统上 daemon 会把数据目录和 `objects/` 设为 `0700`，数据库、WAL/SHM
+伴随文件、PID 与 lock 文件设为 `0600`；数据库启动时会校验 schema 版本并拒绝
+不兼容的库。已有 v0 数据库会在首次打开时登记为 schema version 1。
+
 daemon 固定 bind `127.0.0.1`，v0 不提供鉴权；不要把端口转发到局域网或公网。
 
 由于 daemon 监听在回环地址，而浏览器里的任意网页都能向回环地址发请求，v0 对
@@ -220,9 +224,10 @@ daemon 固定 bind `127.0.0.1`，v0 不提供鉴权；不要把端口转发到�
 ## 验证与开发
 
 ```bash
-cargo fmt -- --check
-cargo check --all-targets
-cargo test --all-targets
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+npm test
 bash scripts/verify/t008-acceptance.sh
 ```
 
@@ -252,10 +257,11 @@ PAGEVILLE_BUILD_TOOL=cross npm run npm:build -- --target aarch64-unknown-linux-g
 每个二进制并发布 GitHub Release 与同版本 npm 包。发布前需要在仓库 Secrets 中配置
 `NPM_TOKEN`；工作流不会把 `prebuilds/` 生成物提交回源码仓库。
 
-`t008-acceptance.sh` 会在各自的临时数据目录中串行执行十一个验收切片，覆盖发布、
+`t008-acceptance.sh` 会在各自的临时数据目录中串行执行十二个验收切片，覆盖发布、
 CAS 幂等、版本路由（含并发发布下的原子 `latest`）、SPA fallback、事件 envelope、
-CLI 面、daemon 生命周期、Atlas 大厅，以及三个回归切片：符号链接不外泄、
+CLI 面、daemon 生命周期、Atlas 大厅，以及四个回归切片：符号链接不外泄、
 浏览器可达面的 Host/Origin/响应头防线、hex 命名资源的路由与时间过滤。
+schema 迁移和不兼容库启动失败也在验收范围内。
 任一切片失败都会立即中止并打印切片名和退出码。单项脚本可用于定位失败。
 
 ## 当前限制与后续方向
@@ -267,8 +273,8 @@ CLI 面、daemon 生命周期、Atlas 大厅，以及三个回归切片：符号
 - daemon 生命周期、存储迁移和协议兼容性仍以本地单机使用为目标；升级前应
   备份数据目录。daemon lock 采用进程级文件锁，进程崩溃后锁会由操作系统释放，
   后续启动不会被遗留文件名卡住。
-- 当前验证以黑盒 shell 验收为主，后续可补充更细的 Rust 单元/集成测试和发布
-  自动化。
+- 当前验收同时包含 Rust 单元测试、npm 启动器测试和黑盒 shell 场景；跨平台发布、
+  依赖安全审计与数据目录迁移仍由发布/安全工作流持续验证。
 
 详细的范围、架构、数据模型与验收标准见 [`docs/PRD/`](docs/PRD/)。
 

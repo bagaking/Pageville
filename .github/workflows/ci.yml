@@ -22,7 +22,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - name: npm metadata
-        run: node scripts/npm/check.js
+      - name: npm package checks
+        run: npm test
       - name: Acceptance suite
         run: bash scripts/verify/t008-acceptance.sh

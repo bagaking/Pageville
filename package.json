@@ -24,7 +24,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "npm run npm:check",
+    "test": "npm run npm:check && node scripts/npm/test.js",
     "npm:check": "node scripts/npm/check.js",
     "npm:build": "node scripts/npm/build.js",
     "npm:stage": "node scripts/npm/stage.js",

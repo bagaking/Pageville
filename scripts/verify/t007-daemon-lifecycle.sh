@@ -4,7 +4,8 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d)"
 port="${PAGEVILLE_PORT:-17783}"
-trap 'PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- daemon stop >/dev/null 2>&1 || true; rm -rf "$tmp_dir"' EXIT
+fake_pid=""
+trap 'PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- daemon stop >/dev/null 2>&1 || true; if [ -n "${fake_pid:-}" ]; then kill "$fake_pid" 2>/dev/null || true; wait "$fake_pid" 2>/dev/null || true; fi; rm -rf "$tmp_dir"' EXIT
 run() { PAGEVILLE_DATA_DIR="$tmp_dir/data" PAGEVILLE_PORT="$port" cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- "$@"; }
 mkdir -p "$tmp_dir/site"
 printf 'lifecycle\n' > "$tmp_dir/site/index.html"
@@ -162,5 +163,50 @@ if bad:
 " "$down_json"
 
 size_run daemon stop >/dev/null 2>&1 || true
+
+# A reachable endpoint that rejects shutdown must make the CLI fail. Treating
+# any HTTP response as success makes scripts believe a daemon stopped when the
+# control request was denied or handled by a foreign service.
+fake_info="$tmp_dir/fake-server.port"
+python3 - "$fake_info" <<'PY' &
+import http.server
+import sys
+from pathlib import Path
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/api/v0/health':
+            self.send_response(200)
+            self.send_header('content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","protocol":"v0"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        self.send_response(500)
+        self.end_headers()
+        self.wfile.write(b'{"error":"shutdown refused"}')
+
+    def log_message(self, *_args):
+        pass
+
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+Path(sys.argv[1]).write_text(str(server.server_address[1]))
+server.serve_forever()
+PY
+fake_pid=$!
+for _ in $(seq 1 50); do test -s "$fake_info" && break || sleep 0.1; done
+fake_port="$(cat "$fake_info")"
+if PAGEVILLE_DATA_DIR="$tmp_dir/fake-data" PAGEVILLE_PORT="$fake_port" \
+    cargo run --quiet --manifest-path "$root_dir/Cargo.toml" -- \
+    --target "http://127.0.0.1:${fake_port}" daemon stop >/dev/null 2>&1; then
+  echo 'FAIL: daemon stop reported success for an HTTP 500 response' >&2
+  exit 1
+fi
+kill "$fake_pid" 2>/dev/null || true
+wait "$fake_pid" 2>/dev/null || true
+fake_pid=""
 
 echo 'PASS: idempotent auto-start, health protocol, clean stop, and restart'

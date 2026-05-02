@@ -10,12 +10,15 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::{self, Write},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process::{Child, Stdio},
@@ -190,27 +193,326 @@ fn base_url(target: Option<&str>) -> String {
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", port()))
 }
 fn validate_target(target: Option<&str>) -> Result<(), String> {
-    if let Some(t) = target {
-        if !(t.starts_with("http://127.0.0.1:") || t.starts_with("http://localhost:")) {
-            return Err(
-                "v0 --target only supports loopback http://127.0.0.1:<port> or localhost".into(),
-            );
-        }
+    let Some(t) = target else { return Ok(()) };
+    let url = reqwest::Url::parse(t).map_err(|_| {
+        "v0 --target must be http://127.0.0.1:<port> or http://localhost:<port>".to_owned()
+    })?;
+    let host_ok = matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
+    let path_ok = url.path().is_empty() || url.path() == "/";
+    if url.scheme() != "http"
+        || !host_ok
+        || url.port().is_none()
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !path_ok
+    {
+        return Err(
+            "v0 --target only supports loopback http://127.0.0.1:<port> or localhost".into(),
+        );
     }
     Ok(())
 }
 fn db_path(data: &FsPath) -> PathBuf {
     data.join("pageville.db")
 }
+
+const DB_SCHEMA_VERSION: i32 = 1;
+const DB_SCHEMA_SQL: &str = "CREATE TABLE pages(page TEXT PRIMARY KEY, latest TEXT NOT NULL); CREATE TABLE snapshots(id TEXT PRIMARY KEY, page TEXT NOT NULL, created_at TEXT NOT NULL, spa INTEGER NOT NULL, manifest TEXT NOT NULL); CREATE TABLE events(event_id TEXT PRIMARY KEY, page TEXT NOT NULL, version TEXT NOT NULL, session TEXT NOT NULL, ts TEXT NOT NULL, identity TEXT, payload TEXT NOT NULL);";
+
+#[derive(Debug)]
+struct SchemaColumn {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    primary_key: bool,
+}
+
+fn schema_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::new(
+        io::ErrorKind::InvalidData,
+        message.into(),
+    )))
+}
+
+/// Return the columns for one of our tables, or `None` when that table does
+/// not exist. Keeping this separate from the DDL lets startup distinguish a
+/// genuinely fresh database from a partially created or incompatible store.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Option<Vec<SchemaColumn>>> {
+    let present = match conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(_) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(error) => return Err(error),
+    };
+    if !present {
+        return Ok(None);
+    }
+
+    // `table` is always one of the compile-time names passed by
+    // `verify_schema`; quote it anyway so this helper cannot become a SQL
+    // injection footgun if another caller is added later.
+    let quoted = table.replace('"', "\"\"");
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{quoted}\")"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SchemaColumn {
+            name: row.get(1)?,
+            declared_type: row.get(2)?,
+            not_null: row.get::<_, i64>(3)? != 0,
+            primary_key: row.get::<_, i64>(5)? != 0,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map(Some)
+}
+
+fn verify_table_schema(
+    conn: &Connection,
+    table: &str,
+    required: &[(&str, &str, bool, bool)],
+) -> rusqlite::Result<()> {
+    let Some(columns) = table_columns(conn, table)? else {
+        return Err(schema_error(format!(
+            "database schema is missing table {table}"
+        )));
+    };
+    for (name, declared_type, not_null, primary_key) in required {
+        let Some(column) = columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(schema_error(format!(
+                "database schema is missing {table}.{name}"
+            )));
+        };
+        if !column.declared_type.eq_ignore_ascii_case(declared_type)
+            || column.not_null != *not_null
+            || column.primary_key != *primary_key
+        {
+            return Err(schema_error(format!(
+                "database schema has incompatible column {table}.{name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_schema(conn: &Connection) -> rusqlite::Result<()> {
+    verify_table_schema(
+        conn,
+        "pages",
+        &[
+            ("page", "TEXT", false, true),
+            ("latest", "TEXT", true, false),
+        ],
+    )?;
+    verify_table_schema(
+        conn,
+        "snapshots",
+        &[
+            ("id", "TEXT", false, true),
+            ("page", "TEXT", true, false),
+            ("created_at", "TEXT", true, false),
+            ("spa", "INTEGER", true, false),
+            ("manifest", "TEXT", true, false),
+        ],
+    )?;
+    verify_table_schema(
+        conn,
+        "events",
+        &[
+            ("event_id", "TEXT", false, true),
+            ("page", "TEXT", true, false),
+            ("version", "TEXT", true, false),
+            ("session", "TEXT", true, false),
+            ("ts", "TEXT", true, false),
+            ("identity", "TEXT", false, false),
+            ("payload", "TEXT", true, false),
+        ],
+    )?;
+    Ok(())
+}
+
+fn verify_integrity(conn: &Connection) -> rusqlite::Result<()> {
+    let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if result.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        Err(schema_error(format!(
+            "database integrity check failed: {result}"
+        )))
+    }
+}
+
+/// Initialize or migrate the on-disk schema. Version zero is the layout used
+/// by the original v0 binary, which had no `user_version` marker. Existing
+/// stores with that layout are adopted in place; partial or incompatible
+/// layouts fail clearly instead of reaching a request handler with missing
+/// columns. Future schema changes should add another explicit match arm.
+fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > DB_SCHEMA_VERSION {
+        return Err(schema_error(format!(
+            "database schema version {version} is newer than supported version {DB_SCHEMA_VERSION}"
+        )));
+    }
+
+    let tables = [
+        table_columns(conn, "pages")?,
+        table_columns(conn, "snapshots")?,
+        table_columns(conn, "events")?,
+    ];
+    let all_absent = tables.iter().all(Option::is_none);
+    let all_present = tables.iter().all(Option::is_some);
+
+    match version {
+        0 => {
+            if !all_absent && !all_present {
+                return Err(schema_error(
+                    "database schema is incomplete; expected pages, snapshots, and events",
+                ));
+            }
+            if all_present {
+                // Legacy stores have no version marker. Validate their shape
+                // before making the migration visible to future processes.
+                verify_schema(conn)?;
+            }
+            let tx = conn.unchecked_transaction()?;
+            if all_absent {
+                tx.execute_batch(DB_SCHEMA_SQL)?;
+            }
+            tx.execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION}"))?;
+            tx.commit()?;
+        }
+        DB_SCHEMA_VERSION => {
+            if !all_present {
+                return Err(schema_error(
+                    "database schema is incomplete; expected pages, snapshots, and events",
+                ));
+            }
+            verify_schema(conn)?;
+        }
+        // `version` cannot be negative because SQLite stores user_version as
+        // an unsigned 32-bit value, but keep the arm explicit for clarity and
+        // to make adding a future migration hard to do accidentally.
+        _ => {
+            return Err(schema_error(format!(
+                "unsupported database schema version {version}"
+            )))
+        }
+    }
+    verify_schema(conn)
+}
+
+/// Create a store directory and keep it private on platforms with POSIX
+/// permission bits. The explicit mode matters even when the process has a
+/// permissive umask: PAGEVILLE_DATA_DIR may contain page contents and event
+/// payloads, so other local users should not be able to traverse it.
+fn ensure_private_dir(path: &FsPath) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o7777 != 0o700 {
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+/// Restrict a regular store file to its owner on POSIX systems. Windows has
+/// no equivalent mode bits; its ACL behavior is left to the process and
+/// parent directory configuration rather than pretending chmod is portable.
+fn ensure_private_file(path: &FsPath) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
+    #[cfg(unix)]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("symlink is not a private store file: {}", path.display()),
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not a regular file: {}", path.display()),
+            ));
+        }
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o7777 != 0o600 {
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_file_if_exists(path: &FsPath) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => ensure_private_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn db(data: &FsPath) -> rusqlite::Result<Connection> {
-    fs::create_dir_all(data).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let conn = Connection::open(db_path(data))?;
+    ensure_private_dir(data).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // SQLite's NOFOLLOW check applies to path components on some platform
+    // VFSes. Resolve the already-created directory first so normal system
+    // aliases such as macOS's /var -> /private/var do not make every fresh
+    // store look like a symlink attack.
+    let canonical_data =
+        fs::canonicalize(data).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let path = canonical_data.join("pageville.db");
+    // Reject an existing symlink before SQLite touches the path, and keep the
+    // no-follow bit on the open itself so a local race cannot redirect the
+    // metadata store between the check and the open.
+    ensure_private_file_if_exists(&path)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // Create the file ourselves so a fresh store can be opened with
+    // SQLITE_OPEN_NOFOLLOW (SQLite cannot combine that flag with CREATE on
+    // every bundled VFS). `create_new` also makes concurrent first opens
+    // harmless: one creator wins and the others open the resulting file.
+    if !path.exists() {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => drop(file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
+        }
+    }
+    ensure_private_file(&path).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(&path, flags)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        ensure_private_file_if_exists(&PathBuf::from(sidecar))
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     // WAL still serializes writers. With the default 0ms timeout an overlapping
     // publish and event POST makes the loser fail instantly with SQLITE_BUSY,
     // dropping a legitimate write that a brief wait would have landed.
     conn.busy_timeout(Duration::from_secs(5))?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS pages(page TEXT PRIMARY KEY, latest TEXT NOT NULL); CREATE TABLE IF NOT EXISTS snapshots(id TEXT PRIMARY KEY, page TEXT NOT NULL, created_at TEXT NOT NULL, spa INTEGER NOT NULL, manifest TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, page TEXT NOT NULL, version TEXT NOT NULL, session TEXT NOT NULL, ts TEXT NOT NULL, identity TEXT, payload TEXT NOT NULL);")?;
+    initialize_schema(&conn)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        ensure_private_file_if_exists(&PathBuf::from(sidecar))
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    }
     Ok(conn)
 }
 fn valid_slug(s: &str) -> bool {
@@ -267,10 +569,12 @@ fn store_size(data: &FsPath) -> (u64, u64) {
             if e.file_name().to_string_lossy().ends_with(".tmp") {
                 continue;
             }
-            if let Ok(m) = e.metadata() {
-                if m.is_file() {
-                    bytes += m.len();
-                    count += 1;
+            if let Ok(file_type) = e.file_type() {
+                if file_type.is_file() && !file_type.is_symlink() {
+                    if let Ok(m) = e.metadata() {
+                        bytes += m.len();
+                        count += 1;
+                    }
                 }
             }
         }
@@ -287,10 +591,28 @@ fn store_size(data: &FsPath) -> (u64, u64) {
 /// apart. The open is read-write-without-create rather than read-only, because
 /// a WAL store at rest has no `-shm` sidecar and a true read-only open fails.
 fn snapshot_count(data: &FsPath) -> Option<i64> {
+    // Keep the missing-store answer side-effect free before resolving the
+    // directory. `db_path` also preserves the distinction between no store
+    // and a path that exists but cannot be canonicalized/read.
     if !db_path(data).exists() {
         return Some(0);
     }
-    Connection::open(db_path(data))
+    let canonical_data = match fs::canonicalize(data) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    if !canonical_data.is_dir() {
+        return None;
+    }
+    let path = canonical_data.join("pageville.db");
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        ensure_private_file_if_exists(&PathBuf::from(sidecar)).ok()?;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(path, flags)
         .and_then(|c| c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0)))
         .ok()
 }
@@ -327,51 +649,183 @@ fn snapshot_hash(page: &str, manifest: &SnapshotManifest) -> String {
     let bytes = serde_json::to_vec(&(page, manifest)).expect("manifest serializable");
     blake3::hash(&bytes).to_hex().to_string()[..12].to_string()
 }
+
+/// Check a stored object by content, not just by its length. A same-length
+/// mutation must be repaired before a publish can rely on the content-addressed
+/// name again.
+fn object_matches(path: &FsPath, hash: &str, expected_len: usize) -> io::Result<bool> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(false);
+        }
+    }
+    let actual = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(actual.len() == expected_len && blake3::hash(&actual).to_hex().to_string() == hash)
+}
+
+fn read_object(data: &FsPath, hash: &str) -> io::Result<Vec<u8>> {
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot contains an invalid object hash",
+        ));
+    }
+    let path = data.join("objects").join(hash);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "content-addressed object is not a regular file",
+        ));
+    }
+    let bytes = fs::read(path)?;
+    if blake3::hash(&bytes).to_hex().to_string() != hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "content-addressed object failed integrity check",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn ensure_object(data: &FsPath, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
     let dir = data.join("objects");
-    fs::create_dir_all(&dir)?;
+    let expected_hash = blake3::hash(bytes).to_hex().to_string();
+    if expected_hash != hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "object name does not match content",
+        ));
+    }
+    ensure_private_dir(&dir)?;
     let path = dir.join(hash);
-    // Trust an existing object only if its size matches. A crash mid-write
-    // leaves a truncated file that `exists()` alone would accept forever,
-    // silently serving half a page. Size is enough here because the name is
-    // the content hash: same name + same length means same bytes.
-    if path.metadata().is_ok_and(|m| m.len() == bytes.len() as u64) {
+    if object_matches(&path, hash, bytes.len())? {
+        ensure_private_file(&path)?;
         return Ok(());
     }
     // Write to a temp file and rename so a crash can never publish a partial
-    // object under its final name. The temp name needs a per-CALL suffix, not
-    // just the pid: concurrent publishes of identical content run as threads of
-    // ONE daemon process, so a pid-only name collides and the loser's rename
-    // fails with ENOENT after the winner renamed the shared temp away.
+    // object under its final name. The temp name needs a per-call suffix, not
+    // just the pid: concurrent publishes of identical content run as threads
+    // of one daemon process, so a pid-only name collides. `create_new` also
+    // skips a stale temp left by a process that crashed before cleanup.
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{}.{}.{}.tmp", hash, std::process::id(), seq));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    let (tmp, mut file) = loop {
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!(".{}.{}.{}.tmp", hash, std::process::id(), seq));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        // Ensure a successfully renamed object contains the complete bytes
+        // even if the machine loses power immediately after the rename.
+        file.sync_all()?;
+        drop(file);
+        ensure_private_file(&tmp)?;
+
+        // Another writer may have installed the same object while this one
+        // was writing. Reusing it avoids replacing a valid object and is the
+        // fast path for the Windows rename fallback below.
+        if object_matches(&path, hash, bytes.len())? {
+            ensure_private_file(&path)?;
+            let _ = fs::remove_file(&tmp);
+            return Ok(());
+        }
+
+        match fs::rename(&tmp, &path) {
+            Ok(()) => ensure_private_file(&path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Unix rename replaces an existing file atomically and should
+                // not take this branch. Windows refuses to replace a file;
+                // first prefer a concurrently installed valid object, then
+                // remove the stale destination and retry. The brief missing
+                // window is a platform limitation of std::fs::rename; no
+                // reader can observe a partially written object.
+                if object_matches(&path, hash, bytes.len())? {
+                    ensure_private_file(&path)?;
+                    let _ = fs::remove_file(&tmp);
+                    return Ok(());
+                }
+                #[cfg(windows)]
+                {
+                    // A concurrent writer may have removed the destination
+                    // between our hash check and this remove. Treat that as
+                    // success and let rename arbitrate the winner; if it
+                    // races with an install, the second check accepts the
+                    // now-valid object instead of returning a spurious 500.
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(remove_err) if remove_err.kind() != io::ErrorKind::NotFound => {
+                            return Err(remove_err)
+                        }
+                        Err(_) => {}
+                    }
+                    match fs::rename(&tmp, &path) {
+                        Ok(()) => ensure_private_file(&path),
+                        Err(rename_err) if rename_err.kind() == io::ErrorKind::AlreadyExists => {
+                            if object_matches(&path, hash, bytes.len())? {
+                                ensure_private_file(&path)?;
+                                let _ = fs::remove_file(&tmp);
+                                Ok(())
+                            } else {
+                                Err(rename_err)
+                            }
+                        }
+                        Err(rename_err) => Err(rename_err),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 fn snapshot_for_page(
     data: &FsPath,
     page: &str,
     version: Option<&str>,
-) -> Option<(String, SnapshotManifest)> {
-    let conn = db(data).ok()?;
+) -> rusqlite::Result<Option<(String, SnapshotManifest)>> {
+    let conn = db(data)?;
     let id = match version {
         Some(v) if v != "latest" => v.to_owned(),
-        _ => conn
-            .query_row("SELECT latest FROM pages WHERE page=?1", [page], |r| {
-                r.get(0)
-            })
-            .ok()?,
+        _ => match conn.query_row("SELECT latest FROM pages WHERE page=?1", [page], |r| {
+            r.get(0)
+        }) {
+            Ok(id) => id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(error),
+        },
     };
-    let raw: String = conn
-        .query_row(
-            "SELECT manifest FROM snapshots WHERE id=?1 AND page=?2",
-            params![id, page],
-            |r| r.get(0),
-        )
-        .ok()?;
-    Some((id, serde_json::from_str(&raw).ok()?))
+    let raw: String = match conn.query_row(
+        "SELECT manifest FROM snapshots WHERE id=?1 AND page=?2",
+        params![id, page],
+        |r| r.get(0),
+    ) {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let manifest = serde_json::from_str(&raw)
+        .map_err(|error| schema_error(format!("invalid snapshot manifest: {error}")))?;
+    Ok(Some((id, manifest)))
 }
 
 async fn health_at(target: Option<&str>) -> bool {
@@ -383,12 +837,20 @@ async fn health_at(target: Option<&str>) -> bool {
     else {
         return false;
     };
-    client
+    let Ok(resp) = client
         .get(format!("{}/api/v0/health", base_url(target)))
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(body) = resp.json::<Value>().await else {
+        return false;
+    };
+    body["status"] == "ok" && body["protocol"] == PROTOCOL
 }
 
 /// The daemon's store report, or None when it is not reachable. Only
@@ -435,13 +897,15 @@ fn try_start_lock(data: &FsPath) -> Result<Option<StartLock>, String> {
     // flock held by the open handle, and writing a pid here only ever recorded
     // the short-lived CLI that won the race, not the daemon. Nothing reads it,
     // so a stale pid was pure misinformation for anyone inspecting the dir.
+    ensure_private_file_if_exists(&path).map_err(|e| format!("cannot protect daemon lock: {e}"))?;
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)
+        .open(&path)
         .map_err(|e| format!("cannot open daemon lock: {e}"))?;
+    ensure_private_file(&path).map_err(|e| format!("cannot protect daemon lock: {e}"))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(StartLock { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -470,7 +934,7 @@ async fn ensure_daemon(target: Option<&str>) -> Result<(), String> {
         return Ok(());
     }
     let data = data_dir();
-    fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+    ensure_private_dir(&data).map_err(|e| e.to_string())?;
     let mut child: Option<Child> = None;
     let mut start_lock = try_start_lock(&data)?;
     for _ in 0..50 {
@@ -828,65 +1292,88 @@ async fn api_publish(
     (StatusCode::OK, Json(out)).into_response()
 }
 
+fn db_failure_response(message: &'static str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
 async fn api_pages(State(st): State<AppState>) -> impl IntoResponse {
-    let Ok(conn) = db(&st.data) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"db unavailable"})),
-        )
-            .into_response();
+    let conn = match db(&st.data) {
+        Ok(conn) => conn,
+        Err(_) => return db_failure_response("database unavailable"),
     };
-    let mut stmt = conn
-        .prepare("SELECT page,latest FROM pages ORDER BY page")
-        .unwrap();
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(PageInfo {
-                page: r.get(0)?,
-                latest: r.get(1)?,
-            })
+    let mut stmt = match conn.prepare("SELECT page,latest FROM pages ORDER BY page") {
+        Ok(stmt) => stmt,
+        Err(_) => return db_failure_response("database read failed"),
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok(PageInfo {
+            page: r.get(0)?,
+            latest: r.get(1)?,
         })
-        .unwrap();
-    let out: Vec<_> = rows.filter_map(Result::ok).collect();
-    Json(out).into_response()
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return db_failure_response("database read failed"),
+    };
+    match rows.collect::<rusqlite::Result<Vec<_>>>() {
+        Ok(out) => Json(out).into_response(),
+        Err(_) => db_failure_response("database read failed"),
+    }
 }
 async fn api_snapshots(State(st): State<AppState>, Path(page): Path<String>) -> impl IntoResponse {
-    let Ok(conn) = db(&st.data) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"db unavailable"})),
-        )
-            .into_response();
+    let conn = match db(&st.data) {
+        Ok(conn) => conn,
+        Err(_) => return db_failure_response("database unavailable"),
     };
-    let mut stmt = conn
-        .prepare(
-            "SELECT id,page,created_at,spa FROM snapshots WHERE page=?1 ORDER BY created_at DESC",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map([page], |r| {
-            Ok(SnapshotInfo {
-                snapshot_id: r.get(0)?,
-                page: r.get(1)?,
-                created_at: r.get(2)?,
-                spa: r.get::<_, i32>(3)? != 0,
-            })
+    let mut stmt = match conn.prepare(
+        "SELECT id,page,created_at,spa FROM snapshots WHERE page=?1 ORDER BY created_at DESC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return db_failure_response("database read failed"),
+    };
+    let rows = match stmt.query_map([page], |r| {
+        Ok(SnapshotInfo {
+            snapshot_id: r.get(0)?,
+            page: r.get(1)?,
+            created_at: r.get(2)?,
+            spa: r.get::<_, i32>(3)? != 0,
         })
-        .unwrap();
-    let out: Vec<_> = rows.filter_map(Result::ok).collect();
-    Json(out).into_response()
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return db_failure_response("database read failed"),
+    };
+    match rows.collect::<rusqlite::Result<Vec<_>>>() {
+        // An unknown page is an ordinary empty list; only a database error is
+        // promoted to 500 above or while collecting rows.
+        Ok(out) => Json(out).into_response(),
+        Err(_) => db_failure_response("database read failed"),
+    }
 }
 async fn api_event_post(
     State(st): State<AppState>,
     Path(page): Path<String>,
     Json(req): Json<EventRequest>,
 ) -> impl IntoResponse {
-    if req.version == "latest" || snapshot_for_page(&st.data, &page, Some(&req.version)).is_none() {
+    if req.version == "latest" {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"version must be an existing snapshot id"})),
         )
             .into_response();
+    }
+    match snapshot_for_page(&st.data, &page, Some(&req.version)) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"version must be an existing snapshot id"})),
+            )
+                .into_response()
+        }
+        Err(_) => return db_failure_response("database unavailable"),
     }
     let ev = EventEnvelope {
         event_id: format!("evt_{}", ulid::Ulid::new()),
@@ -912,8 +1399,9 @@ async fn api_event_get(
     Path(page): Path<String>,
     Query(q): Query<EventQuery>,
 ) -> impl IntoResponse {
-    let Ok(conn) = db(&st.data) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+    let conn = match db(&st.data) {
+        Ok(conn) => conn,
+        Err(_) => return db_failure_response("database unavailable"),
     };
     // An unparseable bound must not silently filter. Falling back to string
     // order here would answer "no events" for a typo, and a caller cannot tell
@@ -933,24 +1421,42 @@ async fn api_event_get(
         "SELECT event_id,version,session,ts,payload FROM events WHERE page=?1 ORDER BY ts,event_id",
     ) {
         Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response(),
+        Err(_) => return db_failure_response("database read failed"),
     };
-    let rows = stmt
-        .query_map([page.clone()], |r| {
-            let payload: String = r.get(4)?;
-            Ok(EventEnvelope {
-                event_id: r.get(0)?,
-                page: page.clone(),
-                version: r.get(1)?,
-                session: r.get(2)?,
-                ts: r.get(3)?,
-                identity: None,
-                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-            })
-        })
-        .unwrap();
+    let rows = match stmt.query_map([page.clone()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return db_failure_response("database read failed"),
+    };
     let mut body = String::new();
-    for row in rows.flatten() {
+    for row in rows {
+        let (event_id, version, session, ts, payload) = match row {
+            Ok(row) => row,
+            Err(_) => return db_failure_response("database read failed"),
+        };
+        let payload = match serde_json::from_str(&payload) {
+            Ok(payload) => payload,
+            Err(_) => return db_failure_response("database contains invalid event payload"),
+        };
+        if parse_ts(&ts).is_none() {
+            return db_failure_response("database contains invalid event timestamp");
+        }
+        let row = EventEnvelope {
+            event_id,
+            page: page.clone(),
+            version,
+            session,
+            ts,
+            identity: None,
+            payload,
+        };
         if q.session.as_ref().is_some_and(|v| v != &row.session)
             || q.version.as_ref().is_some_and(|v| v != &row.version)
             || q.since.as_ref().is_some_and(|v| ts_before(&row.ts, v))
@@ -958,14 +1464,20 @@ async fn api_event_get(
         {
             continue;
         }
-        body.push_str(&serde_json::to_string(&row).unwrap());
+        match serde_json::to_string(&row) {
+            Ok(encoded) => body.push_str(&encoded),
+            Err(_) => return db_failure_response("event serialization failed"),
+        }
         body.push('\n');
     }
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(Body::from(body))
-        .unwrap()
+    {
+        Ok(response) => response,
+        Err(_) => db_failure_response("event response failed"),
+    }
 }
 /// Liveness only. This is the readiness probe every CLI command hits and the
 /// startup spin loop polls, so it must stay constant-time and side-effect free.
@@ -1090,7 +1602,11 @@ async fn api_context(
         Some(v) if looks_like_version(v) => Some(v),
         _ => None,
     };
-    let Some((id, _)) = snapshot_for_page(&st.data, page, version) else {
+    let snapshot = match snapshot_for_page(&st.data, page, version) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return db_failure_response("database unavailable"),
+    };
+    let Some((id, _)) = snapshot else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error":"page not found"})),
@@ -1108,23 +1624,30 @@ async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Res
     }
     let (version, manifest, rel_start) = if parts.get(1).is_some_and(|v| *v == "latest") {
         match snapshot_for_page(&st.data, page, None) {
-            Some((i, m)) => (i, m, 2),
-            None => return StatusCode::NOT_FOUND.into_response(),
+            Ok(Some((i, m))) => (i, m, 2),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return db_failure_response("database unavailable"),
         }
-    } else if let Some((i, m)) = parts
-        .get(1)
-        .filter(|v| looks_like_version(v))
+    } else {
         // Shape alone must not claim the segment: a published file or dir
         // named like a snapshot id (hashed asset names look exactly like
         // this) would otherwise be permanently unreachable. Only route as a
         // version when that snapshot really exists for this page.
-        .and_then(|v| snapshot_for_page(&st.data, page, Some(v)))
-    {
-        (i, m, 2)
-    } else {
-        match snapshot_for_page(&st.data, page, None) {
-            Some((i, m)) => (i, m, 1),
-            None => return StatusCode::NOT_FOUND.into_response(),
+        let pinned = match parts.get(1).filter(|v| looks_like_version(v)) {
+            Some(v) => match snapshot_for_page(&st.data, page, Some(v)) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return db_failure_response("database unavailable"),
+            },
+            None => None,
+        };
+        if let Some((i, m)) = pinned {
+            (i, m, 2)
+        } else {
+            match snapshot_for_page(&st.data, page, None) {
+                Ok(Some((i, m))) => (i, m, 1),
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(_) => return db_failure_response("database unavailable"),
+            }
         }
     };
     let mut rel = parts.get(rel_start..).unwrap_or(&[]).join("/");
@@ -1150,8 +1673,12 @@ async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Res
     } else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(bytes) = fs::read(st.data.join("objects").join(hash)) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let bytes = match read_object(&st.data, &hash) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response()
+        }
+        Err(_) => return db_failure_response("object integrity check failed"),
     };
     let mime = mime_guess::from_path(&served_rel).first_or_octet_stream();
     // Text types need an explicit charset or the browser guesses, which
@@ -1199,15 +1726,22 @@ async fn api_shutdown(State(st): State<AppState>) -> impl IntoResponse {
 
 async fn run_daemon() -> Result<(), String> {
     let data = data_dir();
-    fs::create_dir_all(data.join("objects")).map_err(|e| e.to_string())?;
+    ensure_private_dir(&data).map_err(|e| e.to_string())?;
+    ensure_private_dir(&data.join("objects")).map_err(|e| e.to_string())?;
     if health_at(None).await {
         return Err("daemon already running".into());
     }
-    let _ = db(&data).map_err(|e| e.to_string())?;
+    let conn = db(&data).map_err(|e| e.to_string())?;
+    // Run the expensive integrity check once at daemon startup. Calling it on
+    // every request would turn a small schema guard into a full database scan.
+    verify_integrity(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
     let (tx, rx) = oneshot::channel();
     let pid_path = data.join("daemon.pid");
     let pid_value = std::process::id().to_string();
+    ensure_private_file_if_exists(&pid_path).map_err(|e| e.to_string())?;
     fs::write(&pid_path, &pid_value).map_err(|e| e.to_string())?;
+    ensure_private_file(&pid_path).map_err(|e| e.to_string())?;
     let _pid_guard = PidFileGuard {
         path: pid_path,
         value: pid_value,
@@ -1290,11 +1824,19 @@ async fn main() {
             // port -> data_dir binding anywhere, so the caller's store is a
             // different store and printing its size as the target's answer
             // would be a confident lie. Report nothing rather than that.
-            let report = store_report(cli.target.as_deref()).await;
-            let ok = report.is_some();
+            let ok = health_at(cli.target.as_deref()).await;
+            let report = if ok {
+                store_report(cli.target.as_deref()).await
+            } else {
+                None
+            };
             let store = report.or_else(|| {
-                // Reached only when the daemon did not answer.
-                cli.target.is_none().then(|| {
+                // Reached only when the daemon did not answer. A live daemon
+                // with a temporarily unavailable report remains "running";
+                // never turn a report-path failure into a false liveness
+                // answer. When the daemon is down, local numbers are useful
+                // only when there is no explicit target.
+                (!ok && cli.target.is_none()).then(|| {
                     let dir = data_dir();
                     let (bytes, objects) = store_size(&dir);
                     json!({"object_bytes": bytes, "objects": objects,
@@ -1356,15 +1898,32 @@ async fn main() {
             } else {
                 match http_client() {
                     Err(e) => Err(e),
-                    Ok(client) => client
-                        .post(format!(
-                            "{}/api/v0/shutdown",
-                            base_url(cli.target.as_deref())
-                        ))
-                        .send()
-                        .await
-                        .map_err(|e| e.to_string())
-                        .map(|_| ()),
+                    Ok(client) => {
+                        match client
+                            .post(format!(
+                                "{}/api/v0/shutdown",
+                                base_url(cli.target.as_deref())
+                            ))
+                            .send()
+                            .await
+                        {
+                            Err(e) => Err(e.to_string()),
+                            Ok(response) if response.status().is_success() => Ok(()),
+                            Ok(response) => {
+                                let status = response.status();
+                                let body = response.text().await.unwrap_or_default();
+                                let detail = serde_json::from_str::<Value>(&body)
+                                    .ok()
+                                    .and_then(|v| v["error"].as_str().map(str::to_owned))
+                                    .unwrap_or_else(|| body.trim().to_owned());
+                                Err(if detail.is_empty() {
+                                    format!("{status}: shutdown rejected")
+                                } else {
+                                    format!("{status}: {detail}")
+                                })
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1527,6 +2086,160 @@ mod tests {
     }
 
     #[test]
+    fn schema_initializes_and_adopts_legacy_store() {
+        let fresh = std::env::temp_dir().join(format!(
+            "pageville-schema-fresh-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let _ = fs::remove_dir_all(&fresh);
+        let conn = db(&fresh).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DB_SCHEMA_VERSION);
+        drop(conn);
+        let _ = fs::remove_dir_all(&fresh);
+
+        let legacy = std::env::temp_dir().join(format!(
+            "pageville-schema-legacy-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let _ = fs::remove_dir_all(&legacy);
+        ensure_private_dir(&legacy).unwrap();
+        {
+            let conn = Connection::open(db_path(&legacy)).unwrap();
+            conn.execute_batch(DB_SCHEMA_SQL).unwrap();
+        }
+        let conn = db(&legacy).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DB_SCHEMA_VERSION);
+        drop(conn);
+        let _ = fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn incompatible_schema_is_rejected_before_handlers_run() {
+        let root = std::env::temp_dir().join(format!(
+            "pageville-schema-bad-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        ensure_private_dir(&root).unwrap();
+        {
+            let conn = Connection::open(db_path(&root)).unwrap();
+            conn.execute("CREATE TABLE pages(page TEXT PRIMARY KEY)", [])
+                .unwrap();
+        }
+        assert!(db(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_object_repairs_same_length_corruption() {
+        let root = std::env::temp_dir().join(format!(
+            "pageville-cas-integrity-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let bytes = b"hello-pageville";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+
+        ensure_object(&root, &hash, bytes).unwrap();
+        let object = root.join("objects").join(&hash);
+        assert_eq!(fs::read(&object).unwrap(), bytes);
+
+        // The old size-only check accepted this mutation forever because the
+        // replacement has exactly the same length as the original object.
+        let corrupted = b"jello-pageville";
+        assert_eq!(corrupted.len(), bytes.len());
+        fs::write(&object, corrupted).unwrap();
+        assert_eq!(fs::metadata(&object).unwrap().len(), bytes.len() as u64);
+
+        ensure_object(&root, &hash, bytes).unwrap();
+        assert_eq!(fs::read(&object).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_directories_and_files_are_private() {
+        let root = std::env::temp_dir().join(format!(
+            "pageville-permissions-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        ensure_private_dir(&root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        {
+            let _ = db(&root).unwrap();
+        }
+        assert_eq!(
+            fs::metadata(db_path(&root)).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+
+        let bytes = b"private object";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        ensure_object(&root, &hash, bytes).unwrap();
+        let objects = root.join("objects");
+        let object = objects.join(&hash);
+        assert_eq!(
+            fs::metadata(&objects).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&object).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+
+        // Existing stores are tightened when they are touched again, even if
+        // an earlier umask or manual chmod made an object world-readable.
+        let mut permissions = fs::metadata(&object).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&object, permissions).unwrap();
+        ensure_object(&root, &hash, bytes).unwrap();
+        assert_eq!(
+            fs::metadata(&object).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_symlink_is_rejected_before_open() {
+        let root = std::env::temp_dir().join(format!(
+            "pageville-db-symlink-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let target = root.with_extension("outside");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&target);
+        ensure_private_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&target, db_path(&root)).unwrap();
+        assert!(db(&root).is_err());
+        assert!(
+            !target.exists(),
+            "opening the store must not follow a symlink"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&target);
+    }
+
+    #[test]
     fn timestamps_compare_as_instants_not_strings() {
         let stored = "2026-09-13T11:00:00+00:00";
         // Same instant, three spellings: none may change the answer.
@@ -1582,8 +2295,14 @@ mod tests {
         assert!(validate_target(None).is_ok());
         assert!(validate_target(Some("http://127.0.0.1:7777")).is_ok());
         assert!(validate_target(Some("http://localhost:7777")).is_ok());
+        assert!(validate_target(Some("http://localhost:7777/")).is_ok());
         assert!(validate_target(Some("http://example.com:7777")).is_err());
         assert!(validate_target(Some("https://127.0.0.1:7777")).is_err());
+        assert!(validate_target(Some("http://127.0.0.1")).is_err());
+        assert!(validate_target(Some("http://127.0.0.1:0")).is_err());
+        assert!(validate_target(Some("http://127.0.0.1:7777/api")).is_err());
+        assert!(validate_target(Some("http://user@127.0.0.1:7777")).is_err());
+        assert!(validate_target(Some("http://127.0.0.1:7777?x=1")).is_err());
     }
 
     #[test]

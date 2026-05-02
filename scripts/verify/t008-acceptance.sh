@@ -21,7 +21,8 @@ for check in \
   t009-atlas-root.sh \
   t010-publish-symlink-escape.sh \
   t011-browser-reachable-guards.sh \
-  t012-routing-and-time-filters.sh; do
+  t012-routing-and-time-filters.sh \
+  t013-schema-lifecycle.sh; do
   bash "$root_dir/scripts/verify/$check" || { echo "FAIL: $check exited $?" >&2; exit 1; }
 done
 echo 'PASS: PRD §9 acceptance standards 1-7 plus security and data-plane regressions'

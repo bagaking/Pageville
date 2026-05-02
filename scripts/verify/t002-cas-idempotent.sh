@@ -42,6 +42,22 @@ test "$(wc -c < "$obj" | tr -d ' ')" -eq "$full" || { echo "FAIL: truncated obje
 test "$(curl -fsS "http://127.0.0.1:${port}/demo/")" = 'changed-content'
 test "$(find "$tmp_dir/data/objects" -name '*.tmp' | wc -l | tr -d ' ')" -eq 0
 
+# A same-length bit flip is more subtle than truncation. The object filename is
+# still the original hash, so length-only validation would trust corrupted bytes
+# forever and return a false immutable snapshot.
+python3 -c "
+import sys
+p = sys.argv[1]
+b = bytearray(open(p, 'rb').read())
+b[0] = (b[0] + 1) % 256
+open(p, 'wb').write(b)" "$obj"
+corrupt_status="$(curl -sS -o "$tmp_dir/corrupt.body" -w '%{http_code}' "http://127.0.0.1:${port}/demo/")"
+test "$corrupt_status" = 500 || {
+  echo "FAIL: corrupted CAS object was served with HTTP $corrupt_status" >&2; exit 1; }
+publish demo >/dev/null
+test "$(curl -fsS "http://127.0.0.1:${port}/demo/")" = 'changed-content' || {
+  echo 'FAIL: same-length CAS corruption was not repaired' >&2; exit 1; }
+
 # A rejected publish must write NO objects. Validating and writing in one pass
 # stored the files that passed before bailing on a later bad one, orphaning them
 # permanently: no snapshot row is committed, and snapshots are the only

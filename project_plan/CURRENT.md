@@ -46,6 +46,7 @@
 | [M01_S01.004.FIX](M01_S01.004.FIX.cas_growth_and_publish_ordering.md) | CAS 增长实测 + 发布顺序修复（GC 决策） | **已验收** |
 | [M01_S01.005.FIX](M01_S01.005.FIX.retention_decision_and_store_visibility.md) | 保留策略实测否决 + 存储体积可见化 | **已验收** |
 | [M01_S01.006.FIX](M01_S01.006.FIX.health_probe_overload.md) | 撤销探针过载：/health 回归廉价，store 独立路由 | **已验收** |
+| [M01_S01.007.FIX](M01_S01.007.FIX.integrity_and_operability.md) | CAS/权限/schema/CLI/发布门禁收敛 | **已验收** |
 
 ### 最近一次全量质检结果
 
@@ -57,9 +58,9 @@
 | --- | --- | --- |
 | `cargo fmt --check` | 通过 | macOS |
 | `cargo clippy --all-targets --locked -- -D warnings` | 0 警告 | macOS |
-| `cargo test --locked` | 10/10 | **macOS + 容器** |
-| `node scripts/npm/check.js` | 通过（`pageville@0.1.0; 7 runtimes`） | 容器 |
-| `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0** | **macOS + 容器**（容器限流交替对照 10/10 次） |
+| `cargo test --locked` | 15/15 | macOS |
+| `npm test` | metadata + 3 Node tests 通过 | macOS |
+| `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0** | macOS |
 | O-002 mutation 验证 | `/health` 泄露断言**确认会红**（点名 4 个字段） | 容器 |
 | 60 线程并发发布相同内容 | 0 个 5xx，无残留 tmp | 容器 |
 
@@ -85,7 +86,7 @@
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-node scripts/npm/check.js
+npm test
 bash scripts/verify/t008-acceptance.sh   # 任一切片失败会点名并非零退出
 ```
 
@@ -152,4 +153,5 @@ docker run --rm -v "$PWD":/src:ro -v "$HOME/.cargo/registry":/usr/local/cargo/re
 | [M01_S01.004.FIX...](M01_S01.004.FIX.cas_growth_and_publish_ordering.md) | CAS 增长实测与 GC 决策 |
 | [M01_S01.005.FIX...](M01_S01.005.FIX.retention_decision_and_store_visibility.md) | 保留策略否决与体积可见化 |
 | [M01_S01.006.FIX...](M01_S01.006.FIX.health_probe_overload.md) | 探针过载撤销与同源边界 |
+| [M01_S01.007.FIX...](M01_S01.007.FIX.integrity_and_operability.md) | 完整性、迁移与发布门禁收敛 |
 | [../docs/PRD/](../docs/PRD/2026-05-01-pageville-host.md) | **产品范围与验收标准 SSOT** |

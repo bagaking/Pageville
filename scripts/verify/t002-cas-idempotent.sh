@@ -42,4 +42,29 @@ test "$(wc -c < "$obj" | tr -d ' ')" -eq "$full" || { echo "FAIL: truncated obje
 test "$(curl -fsS "http://127.0.0.1:${port}/demo/")" = 'changed-content'
 test "$(find "$tmp_dir/data/objects" -name '*.tmp' | wc -l | tr -d ' ')" -eq 0
 
+# A rejected publish must write NO objects. Validating and writing in one pass
+# stored the files that passed before bailing on a later bad one, orphaning them
+# permanently: no snapshot row is committed, and snapshots are the only
+# reachability root, so nothing ever reclaims them.
+before="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
+for bad_key in 'zzz/../evil.bin' 'zzz-bad-b64.bin'; do
+  if [ "$bad_key" = 'zzz-bad-b64.bin' ]; then bad_val='!!!not-base64!!!'; else bad_val='RQ=='; fi
+  # Distinct payloads so content-addressing cannot dedupe them into one object.
+  python3 -c "
+import base64, json, sys, urllib.request, urllib.error
+files = {'orphan%d.bin' % i: base64.b64encode(bytes([65+i]) * 50000).decode() for i in range(4)}
+files[sys.argv[1]] = sys.argv[2]
+body = json.dumps({'files': files, 'spa': False}).encode()
+req = urllib.request.Request(sys.argv[3], data=body, headers={'Content-Type': 'application/json'})
+try:
+    urllib.request.urlopen(req, timeout=30)
+    print('FAIL: bad publish was accepted', file=sys.stderr); sys.exit(1)
+except urllib.error.HTTPError as e:
+    sys.exit(0 if e.code == 400 else 1)
+" "$bad_key" "$bad_val" "http://127.0.0.1:${port}/api/v0/pages/demo/snapshots"
+done
+after="$(find "$tmp_dir/data/objects" -type f | wc -l | tr -d ' ')"
+test "$after" -eq "$before" || {
+  echo "FAIL: rejected publishes orphaned $((after - before)) objects" >&2; exit 1; }
+
 echo 'PASS: CAS objects, snapshot manifests, and content-derived snapshot ids are idempotent'

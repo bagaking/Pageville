@@ -634,6 +634,12 @@ async fn api_publish(
         files: BTreeMap::new(),
         spa: req.spa,
     };
+    // Two passes: validate and hash everything BEFORE writing any object.
+    // Interleaving them wrote objects for the files that passed, then bailed on
+    // a later bad one — leaving unreferenced blobs (up to the ~1.5MiB body cap
+    // per bad request) that nothing ever reclaims, since snapshots are the only
+    // reachability root and no snapshot row was ever committed.
+    let mut decoded = Vec::with_capacity(req.files.len());
     for (path, encoded) in req.files {
         if !safe_rel_path(&path) {
             return (
@@ -653,14 +659,17 @@ async fn api_publish(
             }
         };
         let hash = blake3::hash(&bytes).to_hex().to_string();
-        if ensure_object(&st.data, &hash, &bytes).is_err() {
+        manifest.files.insert(path, hash.clone());
+        decoded.push((hash, bytes));
+    }
+    for (hash, bytes) in &decoded {
+        if ensure_object(&st.data, hash, bytes).is_err() {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error":"object write failed"})),
             )
                 .into_response();
         }
-        manifest.files.insert(path, hash);
     }
     let id = snapshot_hash(&page, &manifest);
     let created = Utc::now().to_rfc3339();

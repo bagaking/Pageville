@@ -139,7 +139,8 @@ API 前缀固定为 `/api/v0/`。CLI 是这套协议的第一个客户端。
 | `POST` | `/api/v0/pages/{page}/events` | 追加事件 |
 | `GET` | `/api/v0/pages/{page}/events` | 过滤读取事件（NDJSON） |
 | `GET` | `/api/v0/context?path=...` | 根据页面 URL 查询真实快照版本 |
-| `GET` | `/api/v0/health` | 健康检查和协议版本 |
+| `GET` | `/api/v0/health` | 健康检查和协议版本（常数响应，探针用） |
+| `GET` | `/api/v0/store` | 存储用量：对象数、字节数、快照数 |
 | `POST` | `/api/v0/shutdown` | 请求 daemon 优雅退出 |
 
 ### 发布快照

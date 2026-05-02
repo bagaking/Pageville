@@ -45,17 +45,23 @@
 | [M01_S01.003.FIX](M01_S01.003.FIX.adversarial_probe_findings.md) | 并发/文件系统/生命周期三面探测结论 | **已验收** |
 | [M01_S01.004.FIX](M01_S01.004.FIX.cas_growth_and_publish_ordering.md) | CAS 增长实测 + 发布顺序修复（GC 决策） | **已验收** |
 | [M01_S01.005.FIX](M01_S01.005.FIX.retention_decision_and_store_visibility.md) | 保留策略实测否决 + 存储体积可见化 | **已验收** |
+| [M01_S01.006.FIX](M01_S01.006.FIX.health_probe_overload.md) | 撤销探针过载：/health 回归廉价，store 独立路由 | **已验收** |
 
 ### 最近一次全量质检结果
 
-| 项 | 结果 |
-| --- | --- |
-| `cargo fmt --check` | 通过 |
-| `cargo clippy --all-targets --locked -- -D warnings` | 0 警告 |
-| `cargo test --locked` | 10/10 |
-| `node scripts/npm/check.js` | 通过 |
-| `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0（未经管道实测）** |
-| 60 线程并发发布相同内容 | 0 个 5xx，无残留 tmp |
+> 执行环境：macOS 本机 Defender 拦截 `exec`，新编译的二进制无法启动（见 O-016）。
+> 需要跑二进制的两项改在 **Linux 容器**内执行——CI 本来就是 `ubuntu-latest`，
+> 这是忠实复现 CI，不是降低标准。
+
+| 项 | 结果 | 环境 |
+| --- | --- | --- |
+| `cargo fmt --check` | 通过 | host |
+| `cargo clippy --all-targets --locked -- -D warnings` | 0 警告 | host |
+| `cargo test --locked` | 10/10 | 容器 |
+| `node scripts/npm/check.js` | 通过（`pageville@0.1.0; 7 runtimes`） | 容器 |
+| `bash scripts/verify/t008-acceptance.sh` | 12/12，**退出码 0**（限流交替对照 10/10 次） | 容器 |
+| O-002 mutation 验证 | `/health` 泄露断言**确认会红**（点名 4 个字段） | 容器 |
+| 60 线程并发发布相同内容 | 0 个 5xx，无残留 tmp | 容器 |
 
 ### 已知未决
 
@@ -67,6 +73,11 @@
   （常见负载回收 0.2%，代价是 pinned URL 静默返回 200 配错内容）。已改为把体积
   通过 `daemon status` 暴露给所有者。真要做的三个必要条件记录在该文件末尾。
 - CI 尚未在真实 push 上触发过。
+- **本机验收能力受限（非项目缺陷）**：macOS 上 Microsoft Defender 的 Endpoint
+  Security 扩展拦截 `exec`，**任何新链接的二进制都无法启动**（`int main(){return 0;}`
+  同样挂死在 `_dyld_start`，有界等待 122 秒确认是真挂死）。绕开方式是在 Linux
+  容器内跑门禁（见下方「三、整体质检步骤」的容器命令），**不是**降低标准。
+  重启可清除 `syspolicyd` 空转。
 - 许可证 MIT（依赖树核查无传染性协议，见 PLAN.md）。
 
 ## 三、整体质检步骤（每次重大变更后执行）
@@ -78,6 +89,29 @@ cargo test --locked
 node scripts/npm/check.js
 bash scripts/verify/t008-acceptance.sh   # 任一切片失败会点名并非零退出
 ```
+
+**本机跑不了时的等价跑法**（macOS 安全软件拦截 `exec` 等情况，见 O-016）：
+CI 跑的就是 `ubuntu-latest`，所以在 Linux 容器里跑同一套是**忠实复现**而非放水。
+
+```bash
+docker build -t pageville-ci:bookworm - <<'EOF'
+FROM rust:1.95.0-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      jq python3 curl ca-certificates procps && rm -rf /var/lib/apt/lists/*
+EOF
+
+docker run --rm -v "$PWD":/src:ro -v "$HOME/.cargo/registry":/usr/local/cargo/registry:ro \
+  pageville-ci:bookworm bash -c '
+    mkdir -p /work && cp -a /src/. /work/ && cd /work
+    export CARGO_TARGET_DIR=/work/target   # 容器本地，别挂 volume：编译产物走 virtiofs 很慢
+    cargo test --locked --offline
+    bash scripts/verify/t008-acceptance.sh'
+```
+
+源码用 `:ro` 挂载 + 容器内复制，host 树不会被污染；registry 复用 host 缓存所以可以
+`--offline`（容器内通常连不上 crates.io）。**跑的时候别同时跑别的 docker build**：
+宿主机 CPU 打满时，`ensure_daemon` 的 5 秒自旋预算偶尔不够，会伪装成随机切片失败
+（见 O-015）。
 
 **附加动作**（不可省略，来源见括号）：
 
@@ -98,16 +132,25 @@ bash scripts/verify/t008-acceptance.sh   # 任一切片失败会点名并非零�
    （O-010，已固化进 `t002`）
 9. 给既有命令加输出前，先 grep 谁在消费它；`daemon status` 第一行是裸词契约，
    明细只能追加在后续行。（O-012，已固化进 `t007`/`t011`）
+10. 往 `/api/v0/health` 加任何字段前停手：它是每条命令都打的探针，且与**已发布
+    页面同源**（页面 JS 能读到它的一切）。报告类数据走 `/api/v0/store`。
+    （O-013/O-014，已固化进 `t007`）
+11. 改动只读探针/报告路径后，确认它**不创建**它所报告的对象：全新 HOME 下
+    `daemon status`（daemon 停止）必须不产生 `~/.pageville`。（O-013，已固化进 `t007`）
+12. 验收出现抖动时，做**同负载交替对照**（改动树 vs HEAD 交替跑）再动产品代码：
+    两边失败率一样 = 与改动无关。单跑一边 0 失败不算数，负载不同不可比。
+    （O-015，来源 M01_S01.006）
 
 ## 四、文档索引
 
 | 文件 | 内容 |
 | --- | --- |
 | [PLAN.md](PLAN.md) | 北极星、用户原话、技术选型、许可证决策 |
-| [OPINIONS_001.quality_bar.md](OPINIONS_001.quality_bar.md) | 质量基线与审美（O-001 ~ O-012） |
+| [OPINIONS_001.quality_bar.md](OPINIONS_001.quality_bar.md) | 质量基线与审美（O-001 ~ O-016） |
 | [M01_S01.001.FIX...](M01_S01.001.FIX.security_and_verification.md) | 安全加固与虚假验收修复 |
 | [M01_S01.002.FIX...](M01_S01.002.FIX.data_integrity_and_cli.md) | 数据完整性与 CLI 契约 |
 | [M01_S01.003.FIX...](M01_S01.003.FIX.adversarial_probe_findings.md) | 三面对抗探测结论 |
 | [M01_S01.004.FIX...](M01_S01.004.FIX.cas_growth_and_publish_ordering.md) | CAS 增长实测与 GC 决策 |
 | [M01_S01.005.FIX...](M01_S01.005.FIX.retention_decision_and_store_visibility.md) | 保留策略否决与体积可见化 |
+| [M01_S01.006.FIX...](M01_S01.006.FIX.health_probe_overload.md) | 探针过载撤销与同源边界 |
 | [../docs/PRD/](../docs/PRD/2026-05-01-pageville-host.md) | **产品范围与验收标准 SSOT** |

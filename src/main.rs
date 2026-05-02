@@ -143,7 +143,7 @@ struct EventRequest {
     session: String,
     payload: Value,
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize)]
 struct EventEnvelope {
     event_id: String,
     page: String,
@@ -153,7 +153,7 @@ struct EventEnvelope {
     identity: Option<Value>,
     payload: Value,
 }
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct EventQuery {
     session: Option<String>,
     since: Option<String>,
@@ -278,6 +278,23 @@ fn store_size(data: &FsPath) -> (u64, u64) {
     (bytes, count)
 }
 
+/// Snapshot count for a store, or None when it cannot be read.
+///
+/// Deliberately does NOT use `db()`: that creates the directory and runs DDL,
+/// and a *report* that materializes the thing it reports on is a lie. A
+/// missing store is 0; an unreadable or corrupt one is None, never a confident
+/// 0 — those are different answers and the caller must be able to tell them
+/// apart. The open is read-write-without-create rather than read-only, because
+/// a WAL store at rest has no `-shm` sidecar and a true read-only open fails.
+fn snapshot_count(data: &FsPath) -> Option<i64> {
+    if !db_path(data).exists() {
+        return Some(0);
+    }
+    Connection::open(db_path(data))
+        .and_then(|c| c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0)))
+        .ok()
+}
+
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut v = n as f64;
@@ -358,19 +375,31 @@ fn snapshot_for_page(
 }
 
 async fn health_at(target: Option<&str>) -> bool {
-    health_body(target).await.is_some()
-}
-
-/// The daemon's health body, or None when it is not reachable.
-async fn health_body(target: Option<&str>) -> Option<serde_json::Value> {
     // A short timeout matters: without it a foreign process that accepts the
     // connection but never answers hangs the CLI forever instead of failing.
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{}/api/v0/health", base_url(target)))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// The daemon's store report, or None when it is not reachable. Only
+/// `daemon status` calls this; the liveness probe stays on `/health`.
+async fn store_report(target: Option<&str>) -> Option<serde_json::Value> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .ok()?;
     let resp = client
-        .get(format!("{}/api/v0/health", base_url(target)))
+        .get(format!("{}/api/v0/store", base_url(target)))
         .send()
         .await
         .ok()?;
@@ -938,20 +967,29 @@ async fn api_event_get(
         .body(Body::from(body))
         .unwrap()
 }
-/// Health doubles as the store report. The numbers must come from the daemon
-/// that owns the data, not from the caller's own `PAGEVILLE_DATA_DIR` — those
-/// are different directories whenever a client points at another daemon, and
-/// reading the caller's would report a confidently wrong 0.
-async fn api_health(State(st): State<AppState>) -> impl IntoResponse {
+/// Liveness only. This is the readiness probe every CLI command hits and the
+/// startup spin loop polls, so it must stay constant-time and side-effect free.
+/// It is also reachable from any published page's JavaScript — pages are served
+/// by this same daemon on this same port, so they are same-origin with the API
+/// and no origin check can tell agent-authored content apart from the CLI.
+/// Nothing about the store belongs in this body: see `api_store`.
+async fn api_health() -> impl IntoResponse {
+    Json(json!({"status":"ok", "protocol":"v0", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+/// The store report, for `daemon status`. Kept off `/health` because it costs
+/// a full objects/ scan plus a DB read, and `/health` is the probe every CLI
+/// command hits.
+///
+/// It deliberately does NOT carry `data_dir`. A separate route is no defence
+/// here: published pages are served by this same daemon on this same port, so
+/// they are same-origin and their JavaScript can read any route the CLI can.
+/// An absolute path under $HOME carries the OS username, so the only fix is to
+/// never send it — the CLI knows its own data dir without being told.
+async fn api_store(State(st): State<AppState>) -> impl IntoResponse {
     let (bytes, objects) = store_size(&st.data);
-    let snapshots = db(&st.data)
-        .and_then(|c| c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0)))
-        .unwrap_or(0);
-    Json(
-        json!({"status":"ok", "protocol":"v0", "version": env!("CARGO_PKG_VERSION"),
-                "data_dir": st.data, "object_bytes": bytes, "objects": objects,
-                "snapshots": snapshots}),
-    )
+    Json(json!({"object_bytes": bytes, "objects": objects,
+                "snapshots": snapshot_count(&st.data)}))
 }
 
 /// Reject requests whose Host is not our own loopback address.
@@ -1064,9 +1102,6 @@ async fn api_context(
 
 async fn serve_page(State(st): State<AppState>, Path(path): Path<String>) -> Response {
     let parts: Vec<_> = path.split('/').collect();
-    if parts.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     let page = parts[0];
     if !valid_slug(page) {
         return StatusCode::NOT_FOUND.into_response();
@@ -1184,6 +1219,7 @@ async fn run_daemon() -> Result<(), String> {
     let app = Router::new()
         .route("/", get(atlas_root))
         .route("/api/v0/health", get(api_health))
+        .route("/api/v0/store", get(api_store))
         .route("/api/v0/pages", get(api_pages))
         .route(
             "/api/v0/pages/:page/snapshots",
@@ -1248,45 +1284,64 @@ async fn main() {
             // collectable — so the honest intervention is to make the size
             // visible and let the owner decide, not to delete history for them.
             //
-            // Ask the running daemon: it owns the store. Falling back to the
-            // caller's own data dir when it is down keeps `status` useful
-            // offline, and that is the one case where the two agree.
-            let live = health_body(cli.target.as_deref()).await;
-            let ok = live.is_some();
-            let num = |k: &str| live.as_ref().and_then(|v| v[k].as_u64());
-            let local = data_dir();
-            let (local_bytes, local_objects) = store_size(&local);
-            let data = live
-                .as_ref()
-                .and_then(|v| v["data_dir"].as_str())
-                .map_or(local.clone(), PathBuf::from);
-            let bytes = num("object_bytes").unwrap_or(local_bytes);
-            let objects = num("objects").unwrap_or(local_objects);
-            let snapshots = num("snapshots").map(|n| n as i64).unwrap_or_else(|| {
-                db(&local)
-                    .and_then(|c| {
-                        c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0))
-                    })
-                    .unwrap_or(0)
+            // The report comes from the daemon, which owns the store. When it
+            // is down we can only substitute our own directory if we are in
+            // fact talking about ourselves: with `--target` there is no
+            // port -> data_dir binding anywhere, so the caller's store is a
+            // different store and printing its size as the target's answer
+            // would be a confident lie. Report nothing rather than that.
+            let report = store_report(cli.target.as_deref()).await;
+            let ok = report.is_some();
+            let store = report.or_else(|| {
+                // Reached only when the daemon did not answer.
+                cli.target.is_none().then(|| {
+                    let dir = data_dir();
+                    let (bytes, objects) = store_size(&dir);
+                    json!({"object_bytes": bytes, "objects": objects,
+                           "snapshots": snapshot_count(&dir)})
+                })
             });
+            // The daemon never sends its path (it would reach any published
+            // page's JS, same-origin), so the CLI prints its own. Without
+            // `--target` that is the store we would act on for every other
+            // command, which is the useful thing to show. It can differ from
+            // the answering daemon's own dir if one was started with a
+            // different PAGEVILLE_DATA_DIR on this same port; with `--target`
+            // we genuinely do not know the path, so we print none.
+            let data_dir_shown = cli.target.is_none().then(data_dir);
             if cli.json {
-                println!(
-                    "{}",
-                    json!({"running": ok, "protocol": PROTOCOL, "data_dir": data,
-                           "object_bytes": bytes, "objects": objects, "snapshots": snapshots})
-                );
+                let mut out = json!({"running": ok, "protocol": PROTOCOL});
+                if let Some(d) = data_dir_shown.as_ref() {
+                    out["data_dir"] = json!(d);
+                }
+                if let Some(s) = store.as_ref().and_then(|v| v.as_object()) {
+                    for (k, v) in s {
+                        out[k] = v.clone();
+                    }
+                }
+                println!("{}", out);
             } else {
                 // Line 1 is a contract: the bare word, nothing else, so
                 // `daemon status` stays usable as a shell predicate. Detail
                 // goes below it.
                 println!("{}", if ok { "running" } else { "stopped" });
-                println!(
-                    "data_dir={} objects={} snapshots={} size={}",
-                    data.display(),
-                    objects,
-                    snapshots,
-                    human_bytes(bytes)
-                );
+                if let Some(s) = store.as_ref() {
+                    let show = |k: &str| match s[k].as_u64() {
+                        Some(n) => n.to_string(),
+                        None => "unknown".into(),
+                    };
+                    if let Some(d) = data_dir_shown.as_ref() {
+                        print!("data_dir={} ", d.display());
+                    }
+                    println!(
+                        "objects={} snapshots={} size={}",
+                        show("objects"),
+                        show("snapshots"),
+                        s["object_bytes"]
+                            .as_u64()
+                            .map_or("unknown".into(), human_bytes)
+                    );
+                }
             }
             Ok(())
         }
@@ -1443,6 +1498,31 @@ mod tests {
         // An in-flight publish's temp file must not jitter the reported size.
         fs::write(objects.join(".cc.1.2.tmp"), vec![b'z'; 9999]).unwrap();
         assert_eq!(store_size(&root), (123, 2));
+        // A missing store counts 0 snapshots and must NOT create anything: the
+        // probe answers a question, it does not materialize its subject.
+        assert_eq!(snapshot_count(&root), Some(0));
+        assert!(!db_path(&root).exists(), "counting must not create the db");
+        // A corrupt store is unknown, never a confident 0 — "empty" and
+        // "unreadable" are different answers and callers must tell them apart.
+        fs::write(db_path(&root), b"this is not a database").unwrap();
+        assert_eq!(snapshot_count(&root), None);
+        // A real store, closed cleanly: WAL checkpoints on close and the -shm
+        // sidecar is gone. A true read-only open FAILS on exactly this state,
+        // which is why the count opens read-write-without-create — a read-only
+        // open would report "unreadable" for every healthy stopped daemon.
+        fs::remove_file(db_path(&root)).unwrap();
+        {
+            let c = db(&root).unwrap();
+            c.execute(
+                "INSERT INTO snapshots(id,page,created_at,spa,manifest) VALUES('i','p','t',0,'{}')",
+                [],
+            )
+            .unwrap();
+        }
+        for sfx in ["-shm", "-wal"] {
+            let _ = fs::remove_file(root.join(format!("pageville.db{sfx}")));
+        }
+        assert_eq!(snapshot_count(&root), Some(1), "checkpointed WAL store");
         let _ = fs::remove_dir_all(&root);
     }
 

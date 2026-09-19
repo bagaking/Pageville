@@ -92,7 +92,7 @@ jobs:
           npm run npm:check
           npm run npm:verify
       - name: Attest release archives
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'artifacts/**/*.tar.gz'
       - name: Publish npm package
